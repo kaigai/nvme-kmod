@@ -13,6 +13,7 @@
  * ----------------------------------------------------------------
  */
 #include <libgen.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <unistd.h>
 #include "nvme-strom.h"

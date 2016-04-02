@@ -26,6 +26,8 @@ clean:
 	$(MAKE) -C $(KERNEL_SOURCE) M=$(PWD) $@
 
 %:
-	$(MAKE) -C $(KERNEL_SOURCE) M=$(PWD) $@
+	$(MAKE) -C $(KERNEL_SOURCE) \
+	KBUILD_EXTRA_SYMBOLS=$(NVIDIA_SOURCE)/Module.symvers \
+	NVIDIA_SOURCE=$(NVIDIA_SOURCE) M=$(PWD) $@
 
 .PHONY: default
