@@ -9,13 +9,20 @@
  */
 #include <asm/uaccess.h>
 #include <linux/crc32c.h>
+#include <linux/file.h>
 #include <linux/fs.h>
+#include <linux/genhd.h>
 #include <linux/kallsyms.h>
 #include <linux/kernel.h>
+#include <linux/magic.h>
+#include <linux/major.h>
 #include <linux/module.h>
+#include <linux/nvme.h>
 #include <linux/notifier.h>
 #include <linux/proc_fs.h>
+#include <linux/sched.h>
 #include <linux/slab.h>
+#include <linux/version.h>
 #include "nv-p2p.h"
 #include "nvme-strom.h"
 
@@ -48,7 +55,7 @@ static int (* p_nvidia_p2p_get_pages)(uint64_t p2p_token,
 									  struct nvidia_p2p_page_table **p_table,
 									  void (*free_callback)(void *data),
 									  void *data);
-static inline int
+inline int
 __nvidia_p2p_get_pages(uint64_t p2p_token,
 					   uint32_t va_space,
 					   uint64_t virtual_address,
@@ -125,8 +132,8 @@ xfs_get_blocks(struct inode *inode, sector_t offset,
  *
  *
  * strom_on_release_gpu_memory - callback when device memory is released
- * strom_pin_gpu_memory - ioctl(2) handler to pin device memory
- * strom_unpin_gpu_memory - ioctl(2) handler to unpin device memory
+ * strom_ioctl_pin_gpu_memory - ioctl(2) handler to pin device memory
+ * strom_ioctl_unpin_gpu_memory - ioctl(2) handler to unpin device memory
  *
  * ================================================================
  */
@@ -134,7 +141,7 @@ xfs_get_blocks(struct inode *inode, sector_t offset,
 static spinlock_t		strom_pgmem_locks[PINNED_GPU_MEMORY_NSLOTS];
 static struct list_head	strom_pgmem_slots[PINNED_GPU_MEMORY_NSLOTS];
 
-struct pinned_gpu_memory
+typedef struct pinned_gpu_memory
 {
 	int					refcnt;			/* reference counter */
 	struct list_head	chain;			/* chain to the pgmem_slot */
@@ -142,16 +149,16 @@ struct pinned_gpu_memory
 	uint64_t			base_address;	/* aligned device virtual address */
 	uint64_t			base_offset;	/* offset to user given address */
 	struct nvidia_p2p_page_table *page_table;
-};
+} pinned_gpu_memory;
 
-static struct pinned_gpu_memory *
+static pinned_gpu_memory *
 strom_get_pinned_memory(unsigned long handle)
 {
 	int					index = handle % PINNED_GPU_MEMORY_NSLOTS;
 	spinlock_t		   *lock = &strom_pgmem_locks[index];
 	struct list_head   *slot = &strom_pgmem_slots[index];
 	unsigned long		flags;
-	struct pinned_gpu_memory *pgmem;
+	pinned_gpu_memory  *pgmem;
 
 	spin_lock_irqsave(lock, flags);
 	list_for_each_entry(pgmem, slot, chain)
@@ -175,7 +182,7 @@ not_found:
 }
 
 static void
-strom_put_pinned_memory(struct pinned_gpu_memory *pgmem)
+strom_put_pinned_memory(pinned_gpu_memory *pgmem)
 {
 	int					index = pgmem->handle % PINNED_GPU_MEMORY_NSLOTS;
 	spinlock_t		   *lock = &strom_pgmem_locks[index];
@@ -228,7 +235,7 @@ strom_on_release_gpu_memory(void *data)
 	spinlock_t		   *lock = &strom_pgmem_locks[index];
 	struct list_head   *slot = &strom_pgmem_slots[index];
 	unsigned long		flags;
-	struct pinned_gpu_memory *pgmem;
+	pinned_gpu_memory  *pgmem;
 	struct nvidia_p2p_page_table *page_table = NULL;
 
 	/* find by handle */
@@ -277,20 +284,154 @@ strom_on_release_gpu_memory(void *data)
 }
 
 /*
+ * strom_ioctl_check_supported
  *
+ * ioctl(2) handler for STROM_IOCTL_CHECK_SUPPORTED
+ */
+
+
+static int
+source_file_is_supported(struct file *filp)
+{
+	struct inode		   *f_inode = filp->f_inode;
+	struct super_block	   *i_sb = f_inode->i_sb;
+	struct block_device	   *s_bdev = i_sb->s_bdev;
+	struct file_system_type *s_type = i_sb->s_type;
+	struct gendisk		   *bd_disk = s_bdev->bd_disk;
+	const char			   *dname;
+	int						rc;
+
+	/*
+	 * must have READ permission of the source file
+	 */
+	if ((filp->f_mode & FMODE_READ) == 0)
+	{
+		printk(KERN_ERR NVME_STROM_PREFIX
+			   "process (pid=%u) has no permission to read file\n",
+			   current->pid);
+		return -EACCES;
+	}
+
+
+	/*
+	 * check whether it is on supported filesystem
+	 *
+	 * MEMO: Linux VFS has no reliable way to lookup underlying block
+	 *   number of individual files (and, may be impossible in some
+	 *   filesystems), so our module solves file offset <--> block number
+	 *   on a part of supported filesystems.
+	 *
+	 * supported: ext4, xfs
+	 */
+	if (!((strcmp(s_type->name, "ext4") == 0 &&
+		   s_type->owner == mod_ext4_get_block) ||
+		  (strcmp(s_type->name, "xfs") == 0 &&
+		   s_type->owner == mod_xfs_get_blocks)))
+	{
+		printk(KERN_INFO NVME_STROM_PREFIX
+			   "file_system_type name=%s, not supported", s_type->name);
+		return 1;	/* not supported filesystem */
+	}
+
+	/*
+	 * check whether underlying block device is NVMe-SSD
+	 *
+	 * MEMO: Our assumption is, the supplied file is located on NVMe-SSD,
+	 * with other software layer (like dm-based RAID1).
+	 */
+
+	/* 'devext' shall wrap NVMe-SSD device */
+	if (bd_disk->major != BLOCK_EXT_MAJOR)
+	{
+		printk(KERN_INFO NVME_STROM_PREFIX
+			   "block device major number = %d, not 'blkext'\n",
+			   bd_disk->major);
+		return 1;
+	}
+
+	/* disk_name should be 'nvme%dn%d' */
+	dname = bd_disk->disk_name;
+	if (dname[0] == 'n' &&
+		dname[1] == 'v' &&
+		dname[2] == 'm' &&
+		dname[3] == 'e')
+	{
+		const char *pos = dname + 4;
+		const char *pos_saved = pos;
+
+		while (*pos >= '0' && *pos <= '9')
+			pos++;
+		if (pos != pos_saved && *pos == 'n')
+		{
+			pos_saved = ++pos;
+
+			while (*pos >= '0' && *pos <= '9')
+				pos++;
+			if (pos != pos_saved && *pos == '\0')
+				dname = NULL;	/* OK, it is NVMe-SSD */
+		}
+	}
+
+	if (dname)
+	{
+		printk(KERN_INFO NVME_STROM_PREFIX
+			   "block device '%s' is not supported", dname);
+		return 1;
+	}
+
+	/* try to call ioctl */
+	if (!bd_disk->fops->ioctl)
+	{
+		printk(KERN_INFO NVME_STROM_PREFIX
+			   "block device '%s' does not provide ioctl\n",
+			   bd_disk->disk_name);
+		return 1;
+	}
+
+	rc = bd_disk->fops->ioctl(s_bdev, 0, NVME_IOCTL_ID, 0UL);
+	if (rc < 0)
+	{
+		printk(KERN_INFO NVME_STROM_PREFIX
+			   "ioctl(NVME_IOCTL_ID) on '%s' returned an error: %d\n",
+			   bd_disk->disk_name, rc);
+		return 1;
+	}
+
+	/* OK, we assume the underlying device is supported NVMe-SSD */
+	return 0;
+}
+
+static int
+strom_ioctl_check_supported(StromCmd__CheckSupported __user *uarg)
+{
+	StromCmd__CheckSupported karg;
+	struct file	   *filp;
+	int				rc;
+
+	if (copy_from_user(&karg, uarg, sizeof(karg)))
+		return -EFAULT;
+
+	filp = fget(karg.fdesc);
+	if (!filp)
+		return -EBADF;
+
+	rc = source_file_is_supported(filp);
+
+	fput(filp);
+
+	return rc;
+}
+
+/*
+ * strom_ioctl_pin_gpu_memory
  *
- *
- *
- *
- *
- *
+ * ioctl(2) handler for STROM_IOCTL_PIN_GPU_MEMORY
  */
 static int
-strom_pin_gpu_memory(struct file *file,
-					 struct strom_cmd_pin_gpu_memory_arg __user *uarg)
+strom_ioctl_pin_gpu_memory(StromCmd__PinGpuMemory __user *uarg)
 {
-	struct strom_cmd_pin_gpu_memory_arg karg;
-	struct pinned_gpu_memory   *gmem;
+	StromCmd__PinGpuMemory karg;
+	pinned_gpu_memory  *gmem;
 	size_t				pin_size;
 	int					index;
 	spinlock_t		   *lock;
@@ -301,7 +442,7 @@ strom_pin_gpu_memory(struct file *file,
 	if (copy_from_user(&karg, uarg, sizeof(karg)))
 		return -EFAULT;
 
-	gmem = kmalloc(sizeof(struct pinned_gpu_memory), GFP_KERNEL);
+	gmem = kmalloc(sizeof(pinned_gpu_memory), GFP_KERNEL);
 	if (!gmem)
 		return -ENOMEM;
 
@@ -351,24 +492,19 @@ error_1:
 }
 
 /*
+ * strom_ioctl_unpin_gpu_memory
  *
- *
- *
- *
- *
- *
- *
+ * ioctl(2) handler for STROM_IOCTL_UNPIN_GPU_MEMORY
  */
 static int
-strom_unpin_gpu_memory(struct file *file,
-					   struct strom_cmd_unpin_gpu_memory_arg __user *uarg)
+strom_ioctl_unpin_gpu_memory(StromCmd__UnpinGpuMemory __user *uarg)
 {
-	struct strom_cmd_unpin_gpu_memory_arg karg;
+	StromCmd__UnpinGpuMemory karg;
 	int					index;
 	spinlock_t		   *lock;
 	struct list_head   *slot;
 	unsigned long		flags;
-	struct pinned_gpu_memory *pgmem;
+	pinned_gpu_memory *pgmem;
 
 	if (copy_from_user(&karg, uarg, sizeof(karg)))
 		return -EFAULT;
@@ -419,6 +555,136 @@ strom_unpin_gpu_memory(struct file *file,
 
 /* ================================================================
  *
+ * Main part of SSD-to-GPU P2P DMA
+ *
+ * ================================================================
+ */
+
+#if defined(RHEL_MAJOR) && (RHEL_MAJOR == 7)
+
+
+
+
+
+
+#else
+#error "not supported distribution"
+#endif
+
+
+
+
+
+
+
+static int
+strom_ioctl_dma_ssd2gpu(StromCmd__MemcpySsd2Gpu __user *uarg)
+{
+	StromCmd__MemcpySsd2Gpu karg;
+	pinned_gpu_memory  *pgmem;
+	struct file		   *filp;
+	int					rc = 0;
+
+	if (copy_from_user(&karg, uarg,
+					   offsetof(StromCmd__MemcpySsd2Gpu, chunks)))
+		return -EFAULT;
+
+	pgmem = strom_get_pinned_memory(karg.handle);
+	if (!pgmem)
+	{
+		printk(KERN_ERR NVME_STROM_PREFIX
+			   "Pinned GPU Memory (handle=%lu) not found\n", karg.handle);
+		return -ENOENT;
+	}
+
+	filp = fget(karg.fdesc);
+	if (!filp)
+	{
+		printk(KERN_ERR NVME_STROM_PREFIX
+			   "File descriptor %d not found\n", karg.fdesc);
+		rc = -EBADF;
+		goto out_1;
+	}
+
+	rc = source_file_is_supported(filp);
+	if (rc)
+		goto out_2;
+
+	/* OK, try to kick P2P DMA */
+
+
+
+	/* release resources */
+out_2:
+	fput(filp);
+out_1:
+	strom_put_pinned_memory(pgmem);
+
+	return rc;
+}
+
+/* ================================================================
+ *
+ * For debug
+ *
+ * ================================================================
+ */
+#include <linux/genhd.h>
+
+static int strom_ioctl_debug(StromCmd__Debug __user *uarg)
+{
+	StromCmd__Debug		karg;
+	struct file		   *filp;
+	struct inode	   *f_inode;
+	struct super_block *i_sb;
+    struct address_space *i_mapping;
+	struct block_device *s_bdev;
+	struct gendisk	   *bd_disk;
+
+	if (copy_from_user(&karg, uarg, sizeof(StromCmd__Debug)))
+		return -EFAULT;
+
+	filp = fget(karg.fdesc);
+	printk(KERN_INFO "filp = %p\n", filp);
+	if (!filp)
+		return 0;
+
+	f_inode = filp->f_inode;
+	printk(KERN_INFO "filp->f_inode = %p\n", f_inode);
+	if (!f_inode)
+		goto out;
+
+	i_sb = f_inode->i_sb;
+	i_mapping = f_inode->i_mapping;
+
+	printk(KERN_INFO "f_inode {i_sb = %p, i_mapping = %p}\n", i_sb, i_mapping);
+	if (!i_sb)
+		goto out;
+
+	s_bdev = i_sb->s_bdev;
+	printk(KERN_INFO "i_sb {s_dev = %x s_bdev = %p}\n", i_sb->s_dev, s_bdev);
+
+	if (!s_bdev)
+		goto out;
+	printk(KERN_INFO "s_bdev {bd_inode=%p bd_block_size=%u bd_disk=%p}\n",
+		   s_bdev->bd_inode, s_bdev->bd_block_size, s_bdev->bd_disk);
+
+	bd_disk = s_bdev->bd_disk;
+	if (!bd_disk)
+		goto out;
+
+	printk(KERN_INFO "bd_disk {major=%d first_minor=%d minors=%d disk_name=%s fops=%p",
+		   bd_disk->major, bd_disk->first_minor, bd_disk->minors, bd_disk->disk_name, bd_disk->fops);
+		   
+
+out:
+	fput(filp);
+
+	return 0;
+}
+
+/* ================================================================
+ *
  * file_operations of '/proc/nvme-strom' entry
  *
  * ================================================================
@@ -426,7 +692,8 @@ strom_unpin_gpu_memory(struct file *file,
 static int
 strom_proc_open(struct inode *inode, struct file *file)
 {
-	return -EINVAL;
+	// TODO: print all the mapped GPU memory region using seq_read
+	return 0;
 }
 
 static int
@@ -444,11 +711,20 @@ strom_proc_ioctl(struct file *file,
 
 	switch (cmd)
 	{
+		case STROM_IOCTL_CHECK_SUPPORTED:
+			rc = strom_ioctl_check_supported((void __user *) arg);
+			break;
 		case STROM_IOCTL_PIN_GPU_MEMORY:
-			rc = strom_pin_gpu_memory(file, (void __user *) arg);
+			rc = strom_ioctl_pin_gpu_memory((void __user *) arg);
 			break;
 		case STROM_IOCTL_UNPIN_GPU_MEMORY:
-			rc = strom_unpin_gpu_memory(file, (void __user *) arg);
+			rc = strom_ioctl_unpin_gpu_memory((void __user *) arg);
+			break;
+		case STROM_IOCTL_DMA_SSD2GPU:
+			rc = strom_ioctl_dma_ssd2gpu((void __user *) arg);
+			break;
+		case STROM_IOCTL_DEBUG:
+			rc = strom_ioctl_debug((void __user *) arg);
 			break;
 		default:
 			rc = -EINVAL;
@@ -457,7 +733,49 @@ strom_proc_ioctl(struct file *file,
 	return rc;
 }
 
+/*
+ * strom_solve_extra_symbols
+ *
+ * solve the mandatory symbols on module load time
+ */
+static int __init
+strom_solve_extra_symbols(void)
+{
+	unsigned long	addr;
 
+	/* nvidia_p2p_get_pages */
+	addr = kallsyms_lookup_name("nvidia_p2p_get_pages");
+	if (!addr)
+	{
+		printk(KERN_ERR NVME_STROM_PREFIX
+			   "could not solve the symbol: nvidia_p2p_get_pages\n");
+		return -ENOENT;
+	}
+	p_nvidia_p2p_get_pages = (void *) addr;
+	mod_nvidia_p2p_get_pages = __module_text_address(addr);
+	if (mod_nvidia_p2p_get_pages)
+		__module_get(mod_nvidia_p2p_get_pages);
+	else
+		printk(KERN_NOTICE NVME_STROM_PREFIX
+			   "nvidia_p2p_get_pages is defined at core kernel?\n");
+
+	/* nvidia_p2p_put_pages */
+	addr = kallsyms_lookup_name("nvidia_p2p_put_pages");
+	if (!addr)
+	{
+		printk(KERN_ERR NVME_STROM_PREFIX
+			   "could not solve the symbol: nvidia_p2p_put_pages\n");
+		return -ENOENT;
+	}
+	p_nvidia_p2p_put_pages = (void *) addr;
+	mod_nvidia_p2p_put_pages = __module_text_address(addr);
+	if (mod_nvidia_p2p_put_pages)
+		__module_get(mod_nvidia_p2p_put_pages);
+	else
+		printk(KERN_NOTICE NVME_STROM_PREFIX
+			   "nvidia_p2p_put_pages is defined at core kernel?\n");
+	return 0;
+}
 
 /*
  * strom_update_extra_symbols
@@ -469,36 +787,6 @@ strom_update_extra_symbols(struct notifier_block *nb,
 						   unsigned long action, void *data)
 {
 	unsigned long	addr;
-
-	if (!p_nvidia_p2p_get_pages)
-	{
-		addr = kallsyms_lookup_name("nvidia_p2p_get_pages");
-		if (addr)
-		{
-			mod_nvidia_p2p_get_pages = __module_text_address(addr);
-			if (mod_nvidia_p2p_get_pages)
-				__module_get(mod_nvidia_p2p_get_pages);
-			p_nvidia_p2p_get_pages = (void *) addr;
-			printk(KERN_INFO NVME_STROM_PREFIX
-				   "found nvidia_p2p_get_pages = %p\n",
-				   p_nvidia_p2p_get_pages);
-		}
-	}
-
-	if (!p_nvidia_p2p_put_pages)
-	{
-		addr = kallsyms_lookup_name("nvidia_p2p_put_pages");
-		if (addr)
-		{
-			mod_nvidia_p2p_put_pages = __module_text_address(addr);
-			if (mod_nvidia_p2p_put_pages)
-				__module_get(mod_nvidia_p2p_put_pages);
-			p_nvidia_p2p_put_pages = (void *) addr;
-			printk(KERN_INFO NVME_STROM_PREFIX
-				   "found nvidia_p2p_put_pages = %p\n",
-				   p_nvidia_p2p_put_pages);
-		}
-	}
 
 	if (!p_ext4_get_block)
 	{
@@ -548,6 +836,12 @@ int	__init nvme_strom_init(void)
 {
 	int		rc;
 
+	/* solve the mandatory symbols */
+	rc = strom_solve_extra_symbols();
+	if (rc)
+		return rc;
+
+	/* make "/proc/nvme-strom" entry */
 	nvme_strom_proc = proc_create("nvme-strom",
 								  0444,
 								  NULL,
