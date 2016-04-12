@@ -16,15 +16,28 @@
 #include <linux/kernel.h>
 #include <linux/magic.h>
 #include <linux/major.h>
-#include <linux/module.h>
 #include <linux/nvme.h>
 #include <linux/notifier.h>
 #include <linux/proc_fs.h>
 #include <linux/sched.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/version.h>
 #include "nv-p2p.h"
 #include "nvme-strom.h"
+
+/* prefix of printk */
+#define NVME_STROM_PREFIX "nvme-strom: "
+
+/* check the target kernel to build */
+#if defined(RHEL_MAJOR) && (RHEL_MAJOR == 7)
+#define STROM_TARGET_KERNEL_RHEL7		1
+#else
+#error not supported kernel
+#endif
+
+/* routines for extra symbols */
+#include "extra-ksyms.c"
 
 /*
  * for boundary alignment requirement
@@ -34,92 +47,15 @@
 #define GPU_BOUND_OFFSET	(GPU_BOUND_SIZE-1)
 #define GPU_BOUND_MASK		(~GPU_BOUND_OFFSET)
 
-/* prefix of printk */
-#define NVME_STROM_PREFIX "nvme-strom: "
-
 /* procfs entry of "/proc/nvme-strom" */
 static struct proc_dir_entry  *nvme_strom_proc = NULL;
 
-/*
- * Pointers of symbols not exported.
- */
-#ifndef CONFIG_KALLSYMS
-#error Linux kernel has to be built with CONFIG_KALLSYMS
-#endif
-/* nvidia_p2p_get_pages */
-static struct module *mod_nvidia_p2p_get_pages = NULL;
-static int (* p_nvidia_p2p_get_pages)(uint64_t p2p_token,
-									  uint32_t va_space,
-									  uint64_t virtual_address,
-									  uint64_t length,
-									  struct nvidia_p2p_page_table **p_table,
-									  void (*free_callback)(void *data),
-									  void *data);
-inline int
-__nvidia_p2p_get_pages(uint64_t p2p_token,
-					   uint32_t va_space,
-					   uint64_t virtual_address,
-					   uint64_t length,
-					   struct nvidia_p2p_page_table **page_table,
-					   void (*free_callback)(void *data),
-					   void *data)
-{
-	if (unlikely(!p_nvidia_p2p_get_pages))
-		return -EINVAL;
-	return p_nvidia_p2p_get_pages(p2p_token,
-								  va_space,
-								  virtual_address,
-								  length,
-								  page_table,
-								  free_callback,
-								  data);
-}
 
-/* nvidia_p2p_put_pages */
-static struct module *mod_nvidia_p2p_put_pages = NULL;
-static int (* p_nvidia_p2p_put_pages)(uint64_t p2p_token,
-									  uint32_t va_space,
-									  uint64_t virtual_address,
-									  struct nvidia_p2p_page_table *p_table);
-static inline int
-__nvidia_p2p_put_pages(uint64_t p2p_token, 
-					   uint32_t va_space,
-					   uint64_t virtual_address,
-					   struct nvidia_p2p_page_table *page_table)
-{
-	if (unlikely(!p_nvidia_p2p_put_pages))
-		return -EINVAL;
-	return p_nvidia_p2p_put_pages(p2p_token,
-								  va_space,
-								  virtual_address,
-								  page_table);
-}
 
-/* ext4_get_block */
-static struct module *mod_ext4_get_block = NULL;
-static int (* p_ext4_get_block)(struct inode *inode, sector_t offset,
-								struct buffer_head *bh, int create) = NULL;
-static inline int
-ext4_get_block(struct inode *inode, sector_t offset,
-			   struct buffer_head *bh, int create)
-{
-	if (unlikely(!p_ext4_get_block))
-		return -EINVAL;
-	return p_ext4_get_block(inode, offset, bh, create);
-}
 
-/* xfs_get_blocks */
-static struct module *mod_xfs_get_blocks = NULL;
-static int (* p_xfs_get_blocks)(struct inode *inode, sector_t offset,
-								struct buffer_head *bh, int create) = NULL;
-static inline int
-xfs_get_blocks(struct inode *inode, sector_t offset,
-			   struct buffer_head *bh, int create)
-{
-	if (unlikely(!p_xfs_get_blocks))
-		return -EINVAL;
-	return p_xfs_get_blocks(inode, offset, bh, create);
-}
+
+
+
 
 /* ================================================================
  *
@@ -131,115 +67,99 @@ xfs_get_blocks(struct inode *inode, sector_t offset,
  *
  *
  *
- * strom_on_release_gpu_memory - callback when device memory is released
  * strom_ioctl_pin_gpu_memory - ioctl(2) handler to pin device memory
  * strom_ioctl_unpin_gpu_memory - ioctl(2) handler to unpin device memory
  *
  * ================================================================
  */
 #define PINNED_GPU_MEMORY_NSLOTS		100
-static spinlock_t		strom_pgmem_locks[PINNED_GPU_MEMORY_NSLOTS];
+static struct mutex		strom_pgmem_mutex[PINNED_GPU_MEMORY_NSLOTS];
 static struct list_head	strom_pgmem_slots[PINNED_GPU_MEMORY_NSLOTS];
+
+static inline int
+strom_pgmem_index(unsigned long handle)
+{
+	u32		hash = arch_fast_hash(&handle, sizeof(unsigned long),
+								  PINNED_GPU_MEMORY_NSLOTS);
+	return hash % PINNED_GPU_MEMORY_NSLOTS;
+}
 
 typedef struct pinned_gpu_memory
 {
-	int					refcnt;			/* reference counter */
-	struct list_head	chain;			/* chain to the pgmem_slot */
+	struct list_head	chain;			/* chain to the strom_pgmem_slots */
+	int					usecnt;			/* number of concurrent tasks */
+	pid_t				owner;			/* PID of the task who pinned */
 	unsigned long		handle;			/* identifier of this entry */
 	uint64_t			base_address;	/* aligned device virtual address */
 	uint64_t			base_offset;	/* offset to user given address */
-	struct nvidia_p2p_page_table *page_table;
+	uint64_t			base_length;	/* length from the base_address */
+	struct task_struct *wait_task;		/* task waiting for DMA completion */
+	nvidia_p2p_page_table_t *page_table;
+	/*
+	 * NOTE: Exclusion control. Once a pinned_gpu_memory is registered,
+	 * it can be released by random and concurrent timing on ioclt(2),
+	 * cuFreeMem() and others.
+	 * If usecnt > 0, it means someone's DMA is in progress, so cleanup
+	 * routine has to wait for completion, but detach pinned_gpu_memory
+	 * entry from the slot not to be released twice or more.
+	 */
 } pinned_gpu_memory;
+
 
 static pinned_gpu_memory *
 strom_get_pinned_memory(unsigned long handle)
 {
-	int					index = handle % PINNED_GPU_MEMORY_NSLOTS;
-	spinlock_t		   *lock = &strom_pgmem_locks[index];
+	int					index = strom_pgmem_index(handle);
+	struct mutex	   *mutex = &strom_pgmem_mutex[index];
 	struct list_head   *slot = &strom_pgmem_slots[index];
-	unsigned long		flags;
 	pinned_gpu_memory  *pgmem;
 
-	spin_lock_irqsave(lock, flags);
+	mutex_lock(mutex);
 	list_for_each_entry(pgmem, slot, chain)
 	{
 		if (pgmem->handle != handle)
 			continue;
+		/* sanity checks */
 		BUG_ON((unsigned long)pgmem != handle);
+		BUG_ON(!pgmem->page_table);
 
-		/* is it still valid? */
-		if (!pgmem->page_table)
-			goto not_found;
+		pgmem->usecnt++;
 
-		pgmem->refcnt++;
-
-		spin_unlock_irqrestore(lock, flags);
+		mutex_unlock(mutex);
 		return pgmem;
 	}
-not_found:
-	spin_unlock_irqrestore(lock, flags);
-	return NULL;
+	mutex_unlock(mutex);
+
+	return NULL;	/* not found */
 }
 
 static void
 strom_put_pinned_memory(pinned_gpu_memory *pgmem)
 {
-	int					index = pgmem->handle % PINNED_GPU_MEMORY_NSLOTS;
-	spinlock_t		   *lock = &strom_pgmem_locks[index];
-	unsigned long		flags;
+	int			index = strom_pgmem_index(pgmem->handle);
 
-	spin_lock_irqsave(lock, flags);
-	if (--pgmem->refcnt > 0)
-	{
-		/* quick bailout if this pinned gpu memory is still valid  */
-		spin_unlock_irqrestore(lock, flags);
-		return;
-	}
-
-	/* once detached, never acquired again */
-	list_del(&pgmem->chain);
-	spin_unlock_irqrestore(lock, flags);
-	/*
-	 * MEMO: nvidia_p2p_put_pages() is implemented in the proprietary
-	 * driver portion, thus, we cannot ensure whether it is workable
-	 * under the spinlock. So, we choose a safe design.
-	 */
-
-	/* is the page_table still valid? */
-	if (pgmem->page_table)
-	{
-		int		rc = __nvidia_p2p_put_pages(0,	/* p2p_token */
-											0,	/* va_space_token */
-											pgmem->base_address,
-											pgmem->page_table);
-		if (rc)
-			printk(KERN_ERR NVME_STROM_PREFIX
-				   "failed on nvidia_p2p_put_pages: %d\n", rc);
-	}
-	printk(KERN_INFO NVME_STROM_PREFIX
-		   "Pinned GPU Memory Handle %lu was released", pgmem->handle);
-	kfree(pgmem);
+	mutex_lock(&strom_pgmem_mutex[index]);
+	BUG_ON(pgmem->usecnt == 0);
+	pgmem->usecnt--;
+	if (pgmem->usecnt == 0 && pgmem->wait_task != NULL)
+		wake_up_process(pgmem->wait_task);
+	mutex_unlock(&strom_pgmem_mutex[index]);
 }
 
 /*
- * strom_on_release_gpu_memory
- *
- * callback handler to release P2P page tables when GPU device memory block
- * is released.
+ * strom_clenup_gpu_memory - remove P2P page tables
  */
 static void
-strom_on_release_gpu_memory(void *data)
+strom_clenup_gpu_memory(void *private)
 {
-	unsigned long		handle = (unsigned long) data;
-	int					index = handle % PINNED_GPU_MEMORY_NSLOTS;
-	spinlock_t		   *lock = &strom_pgmem_locks[index];
+	unsigned long		handle = (unsigned long) private;
+	int					index = strom_pgmem_index(handle);
+	struct mutex	   *mutex = &strom_pgmem_mutex[index];
 	struct list_head   *slot = &strom_pgmem_slots[index];
-	unsigned long		flags;
 	pinned_gpu_memory  *pgmem;
-	struct nvidia_p2p_page_table *page_table = NULL;
+	int					rc;
 
-	/* find by handle */
-	spin_lock_irqsave(lock, flags);
+	mutex_lock(mutex);
 	list_for_each_entry(pgmem, slot, chain)
 	{
 		if (pgmem->handle != handle)
@@ -247,49 +167,59 @@ strom_on_release_gpu_memory(void *data)
 
 		/* sanity check */
 		BUG_ON((unsigned long)pgmem != handle);
+		BUG_ON(!pgmem->page_table);
 
-		/* page table has to be still valid */
-		if (!pgmem->page_table)
-			panic(NVME_STROM_PREFIX
-				  "nvidia_p2p_page_table is invalid on free callback\n");
-		page_table = pgmem->page_table;
-		pgmem->page_table = NULL;
+		/*
+		 * detach entry; no concurrent task can never touch this
+		 * entry any more.
+		 */
+		list_del(&pgmem->chain);
 
-		/* someone still reference? */
-		if (--pgmem->refcnt == 0)
+		/*
+		 * needs to wait for completion of concurrent DMA completion,
+		 * if any task are running on.
+		 */
+		while (pgmem->usecnt > 0)
 		{
-			list_del(&pgmem->chain);
-			kfree(pgmem);
-		}
-	}
-	spin_unlock_irqrestore(lock, flags);
+			BUG_ON(pgmem->wait_task != NULL);
+			pgmem->wait_task = current;
+			set_current_state(TASK_UNINTERRUPTIBLE);
+			mutex_unlock(mutex);
 
-	/*
-	 * release nvidia_p2p_page_table out of the spinlock
-	 *
-	 * MEMO: nvidia_p2p_put_pages() is implemented in the proprietary
-	 * driver portion, thus, we cannot ensure whether it is workable
-	 * under the spinlock. So, we choose a safe design.
-	 */
-	if (page_table)
-	{
-		int		rc = __nvidia_p2p_put_pages(0,	/* p2p_token */
-											0,	/* va_space_token */
-											pgmem->base_address,
-											pgmem->page_table);
+			schedule();
+
+			mutex_lock(mutex);
+		}
+		mutex_unlock(mutex);
+
+		/*
+		 * OK, at this point, no concurrent task does not use this
+		 * P2P GPU Memory.
+		 */
+		rc = __nvidia_p2p_free_page_table(pgmem->page_table);
 		if (rc)
 			printk(KERN_ERR NVME_STROM_PREFIX
-				   "failed on nvidia_p2p_put_pages: %d\n", rc);
+				   "nvidia_p2p_free_page_table (handle=%lu, rc=%d)\n",
+				   handle, rc);
+
+		kfree(pgmem);
+
+		printk(KERN_ERR NVME_STROM_PREFIX
+			   "P2P GPU Memory (handle=%lu) was released\n", handle);
+		return;
 	}
+	mutex_unlock(mutex);
+	printk(KERN_ERR NVME_STROM_PREFIX
+		   "P2P GPU Memory (handle=%lu) already released\n", handle);
 }
 
+
+
+
 /*
- * strom_ioctl_check_supported
- *
- * ioctl(2) handler for STROM_IOCTL_CHECK_SUPPORTED
+ * source_file_is_supported - checks whether the supplied 'filp' is
+ * available to read contents using P2P DMA on NVMe SSD.
  */
-
-
 static int
 source_file_is_supported(struct file *filp)
 {
@@ -401,6 +331,11 @@ source_file_is_supported(struct file *filp)
 	return 0;
 }
 
+/*
+ * strom_ioctl_check_supported
+ *
+ * ioctl(2) handler for STROM_IOCTL_CHECK_SUPPORTED
+ */
 static int
 strom_ioctl_check_supported(StromCmd__CheckSupported __user *uarg)
 {
@@ -431,13 +366,9 @@ static int
 strom_ioctl_pin_gpu_memory(StromCmd__PinGpuMemory __user *uarg)
 {
 	StromCmd__PinGpuMemory karg;
-	pinned_gpu_memory  *gmem;
-	size_t				pin_size;
-	int					index;
-	spinlock_t		   *lock;
-	struct list_head   *slot;
-	unsigned long		flags;
-	int					rc;
+	pinned_gpu_memory *gmem;
+	int			index;
+	int			rc;
 
 	if (copy_from_user(&karg, uarg, sizeof(karg)))
 		return -EFAULT;
@@ -446,22 +377,29 @@ strom_ioctl_pin_gpu_memory(StromCmd__PinGpuMemory __user *uarg)
 	if (!gmem)
 		return -ENOMEM;
 
-	gmem->refcnt = 1;
 	INIT_LIST_HEAD(&gmem->chain);
+	gmem->usecnt = 0;
+	gmem->owner = current->tgid;
 	gmem->handle = (unsigned long) gmem;	/* pointer as unique identifier */
 	gmem->base_address = karg.address & GPU_BOUND_MASK;
 	gmem->base_offset = karg.address - gmem->base_address;
+	gmem->base_length = gmem->base_offset + karg.length;
+	gmem->wait_task = NULL;
 
-	pin_size = karg.address + karg.length - gmem->base_address;
 	rc = __nvidia_p2p_get_pages(0,	/* p2p_token; deprecated */
 								0,	/* va_space_token; deprecated */
 								gmem->base_address,
-								pin_size,
+								gmem->base_length,
 								&gmem->page_table,
-								strom_on_release_gpu_memory,
+								strom_clenup_gpu_memory,
 								gmem);
 	if (rc)
+	{
+		printk(KERN_ERR NVME_STROM_PREFIX
+			   "failed on nvidia_p2p_get_pages(addr=%p, length=%zu), rc=%d\n",
+			   (void *)gmem->base_address, (size_t)gmem->base_length, rc);
 		goto error_1;
+	}
 
 	/*
 	 * return handle of pinned_gpu_memory
@@ -470,16 +408,34 @@ strom_ioctl_pin_gpu_memory(StromCmd__PinGpuMemory __user *uarg)
 	if (rc)
 		goto error_2;
 
+	/* debug output */
+	{
+		nvidia_p2p_page_table_t *page_table = gmem->page_table;
+
+		printk(KERN_INFO NVME_STROM_PREFIX
+			   "P2P GPU Memory (handle=%lu) was mapped\n"
+			   "  version=%u, page_size=%u, entries=%u\n",
+			   gmem->handle,
+			   page_table->version,
+			   page_table->page_size,
+			   page_table->entries);
+		for (index=0; index < page_table->entries; index++)
+		{
+			printk(KERN_INFO NVME_STROM_PREFIX
+				   "  H:%p <--> D:%p\n",
+				   (void *)(gmem->base_address +
+							index * page_table->page_size),
+				   (void *)(page_table->pages[index]->physical_address));
+		}
+	}
+
 	/*
 	 * attach this pinned_gpu_memory
 	 */
-	index = gmem->handle % PINNED_GPU_MEMORY_NSLOTS;
-	lock = &strom_pgmem_locks[index];
-	slot = &strom_pgmem_slots[index];
-
-	spin_lock_irqsave(lock, flags);
-	list_add(slot, &gmem->chain);
-	spin_unlock_irqrestore(lock, flags);
+	index = strom_pgmem_index(gmem->handle);
+	mutex_lock(&strom_pgmem_mutex[index]);
+	list_add(&strom_pgmem_slots[index], &gmem->chain);
+	mutex_unlock(&strom_pgmem_mutex[index]);
 
 	return 0;
 
@@ -501,54 +457,84 @@ strom_ioctl_unpin_gpu_memory(StromCmd__UnpinGpuMemory __user *uarg)
 {
 	StromCmd__UnpinGpuMemory karg;
 	int					index;
-	spinlock_t		   *lock;
+	struct mutex	   *mutex;
 	struct list_head   *slot;
-	unsigned long		flags;
-	pinned_gpu_memory *pgmem;
+	pinned_gpu_memory  *pgmem;
+	int					rc;
 
 	if (copy_from_user(&karg, uarg, sizeof(karg)))
 		return -EFAULT;
 
-	index = karg.handle % PINNED_GPU_MEMORY_NSLOTS;
-	lock = &strom_pgmem_locks[index];
+	index = strom_pgmem_index(karg.handle);
+	mutex = &strom_pgmem_mutex[index];
 	slot = &strom_pgmem_slots[index];
 
-	spin_lock_irqsave(lock, flags);
+	mutex_lock(mutex);
 	list_for_each_entry(pgmem, slot, chain)
 	{
 		if (pgmem->handle != karg.handle)
 			continue;
+
+		/* sanity checks */
 		BUG_ON((unsigned long)pgmem != karg.handle);
+		BUG_ON(!pgmem->page_table);
 
-		/* quick bailout if this pinned gpu memory is still valid  */
-		if (--pgmem->refcnt > 0)
-		{
-			spin_unlock_irqrestore(lock, flags);
-			return 0;
-		}
-
-		/* once detached, never acquired again */
+		/*
+		 * detach entry; no concurrent task can never touch this
+		 * entry any more.
+		 */
 		list_del(&pgmem->chain);
-		spin_unlock_irqrestore(lock, flags);
 
-		/* is the page_table still valid? */
-		if (pgmem->page_table)
+		/*
+		 * needs to wait for completion of concurrent DMA completion,
+		 * if any task are running on.
+		 */
+		while (pgmem->usecnt > 0)
 		{
-			int		rc = __nvidia_p2p_put_pages(0,	/* p2p_token */
-												0,	/* va_space_token */
-												pgmem->base_address,
-												pgmem->page_table);
-			if (rc)
-				printk(KERN_ERR NVME_STROM_PREFIX
-					   "failed on nvidia_p2p_put_pages: %d\n", rc);
+			BUG_ON(pgmem->wait_task != NULL);
+			pgmem->wait_task = current;
+			set_current_state(TASK_UNINTERRUPTIBLE);
+			mutex_unlock(mutex);
+
+			schedule();
+
+			mutex_lock(mutex);
 		}
+		mutex_unlock(mutex);
+
+		rc = __nvidia_p2p_put_pages(0,	/* p2p_token */
+									0,	/* va_space_token */
+									pgmem->base_address,
+									pgmem->page_table);
+		if (rc)
+		{
+			/* hmm... we have to attach pgmem again... */
+			pgmem->wait_task = NULL;
+			mutex_lock(mutex);
+			list_add(slot, &pgmem->chain);
+			mutex_unlock(mutex);
+
+			printk(KERN_ERR NVME_STROM_PREFIX
+				   "nvidia_p2p_put_pages (handle=%lu, addr=%p, rc=%d)\n",
+				   karg.handle, (void *)pgmem->base_address, rc);
+			return rc;
+		}
+
+		rc = __nvidia_p2p_free_page_table(pgmem->page_table);
+		if (rc)
+			printk(KERN_ERR NVME_STROM_PREFIX
+				   "nvidia_p2p_free_page_table (handle=%lu, rc=%d)\n",
+				   karg.handle, rc);
+
 		printk(KERN_INFO NVME_STROM_PREFIX
-			   "Pinned GPU Memory Handle %lu was released", pgmem->handle);
+			   "P2P GPU Memory (handle=%lu) was unmapped\n",
+			   pgmem->handle);
+
 		kfree(pgmem);
 
 		return 0;
 	}
-	spin_unlock_irqrestore(lock, flags);
+	mutex_unlock(mutex);
 
 	return -ENOENT;
 }
@@ -559,20 +545,6 @@ strom_ioctl_unpin_gpu_memory(StromCmd__UnpinGpuMemory __user *uarg)
  *
  * ================================================================
  */
-
-#if defined(RHEL_MAJOR) && (RHEL_MAJOR == 7)
-
-
-
-
-
-
-#else
-#error "not supported distribution"
-#endif
-
-
-
 
 
 
@@ -689,21 +661,144 @@ out:
  *
  * ================================================================
  */
-static int
-strom_proc_open(struct inode *inode, struct file *file)
+static void *
+strom_proc_seq_start(struct seq_file *m, loff_t *pos)
 {
-	// TODO: print all the mapped GPU memory region using seq_read
-	return 0;
+	unsigned long		handle = (unsigned long) m->private;
+	struct mutex	   *mutex;
+	struct list_head   *slot;
+	pinned_gpu_memory  *pgmem;
+	int					index;
+
+	if (handle == 0)
+		index = 0;		/* walk on the slot from the head */
+	else
+	{
+		bool			pickup_next = false;
+
+		index = strom_pgmem_index(handle);
+		mutex = &strom_pgmem_mutex[index];
+		slot  = &strom_pgmem_slots[index];
+
+		mutex_lock(mutex);
+		list_for_each_entry(pgmem, slot, chain)
+		{
+			if (pickup_next)
+			{
+				m->private = (void *) pgmem->handle;
+				return pgmem;
+			}
+			if (pgmem->handle == handle)
+				pickup_next = true;
+		}
+		mutex_unlock(mutex);
+
+		index++;
+	}
+
+	while (index < PINNED_GPU_MEMORY_NSLOTS)
+	{
+		mutex	= &strom_pgmem_mutex[index];
+		slot	= &strom_pgmem_slots[index];
+
+		mutex_lock(mutex);
+		list_for_each_entry(pgmem, slot, chain)
+		{
+			m->private = (void *) pgmem->handle;
+			return pgmem;
+		}
+		mutex_unlock(mutex);
+
+		index++;
+	}
+	return NULL;	/* no entry was registered */
+}
+
+static void *
+strom_proc_seq_next(struct seq_file *m, void *p, loff_t *pos)
+{
+	pinned_gpu_memory  *pgmem = (pinned_gpu_memory *) p;
+	int					index = strom_pgmem_index(pgmem->handle);
+	struct mutex	   *mutex = &strom_pgmem_mutex[index];
+	struct list_head   *slot = &strom_pgmem_slots[index];
+
+	/* pick up next entry in the same slot (still in lock) */
+	list_for_each_entry_continue(pgmem, slot, chain)
+		return pgmem;
+	mutex_unlock(mutex);
+
+	/* no entry any more, so pick up the next entry from the next slot */
+	while (++index < PINNED_GPU_MEMORY_NSLOTS)
+	{
+		mutex = &strom_pgmem_mutex[index];
+		slot = &strom_pgmem_slots[index];
+
+		mutex_lock(mutex);
+		list_for_each_entry(pgmem, slot, chain);
+			return pgmem;
+		mutex_unlock(mutex);
+	}
+	/* No pinned GPU memory any more */
+	return NULL;
+}
+
+static void
+strom_proc_seq_stop(struct seq_file *m, void *p)
+{
+	pinned_gpu_memory  *pgmem = (pinned_gpu_memory *) p;
+
+	if (!pgmem)
+		m->private = (void *) 0UL;	/* clear it */
+	else
+	{
+		int		index = strom_pgmem_index(pgmem->handle);
+
+		m->private = (void *) pgmem->handle;
+		mutex_unlock(&strom_pgmem_mutex[index]);
+	}
 }
 
 static int
-strom_proc_release(struct inode *inode, struct file *file)
+strom_proc_seq_show(struct seq_file *m, void *p)
 {
+	pinned_gpu_memory *pgmem = (pinned_gpu_memory *) p;
+	nvidia_p2p_page_table_t *page_table = pgmem->page_table;
+	int			i;
+
+	seq_printf(m, "P2P DMA GPU Mapping (handle=%lu, pid=%u, vaddress=%p-%p)\n",
+			   pgmem->handle,
+			   pgmem->owner,
+			   (void *)(pgmem->base_address + pgmem->base_offset),
+			   (void *)(pgmem->base_address + pgmem->base_length));
+	seq_printf(m, "    GPU Page Table (ver=%u, page_size=%u, entries=%u)\n",
+			   page_table->version,
+			   page_table->page_size,
+			   page_table->entries);
+	for (i=0; i < page_table->entries; i++)
+	{
+		seq_printf(m, "    H:%p <--> D:%p\n",
+				   (void *)(pgmem->base_address + page_table->page_size * i),
+				   (void *)(page_table->pages[i]->physical_address));
+	}
+
 	return 0;
+}
+
+static const struct seq_operations strom_proc_seq_ops = {
+	.start		= strom_proc_seq_start,
+	.next		= strom_proc_seq_next,
+	.stop		= strom_proc_seq_stop,
+	.show		= strom_proc_seq_show,
+};
+
+static int
+strom_proc_open(struct inode *inode, struct file *filp)
+{
+	return seq_open(filp, &strom_proc_seq_ops);
 }
 
 static long
-strom_proc_ioctl(struct file *file,
+strom_proc_ioctl(struct file *filp,
 				 unsigned int cmd,
 				 unsigned long arg)
 {
@@ -733,113 +828,27 @@ strom_proc_ioctl(struct file *file,
 	return rc;
 }
 
-/*
- * strom_solve_extra_symbols
- *
- * solve the mandatory symbols on module load time
- */
-static int __init
-strom_solve_extra_symbols(void)
-{
-	unsigned long	addr;
-
-	/* nvidia_p2p_get_pages */
-	addr = kallsyms_lookup_name("nvidia_p2p_get_pages");
-	if (!addr)
-	{
-		printk(KERN_ERR NVME_STROM_PREFIX
-			   "could not solve the symbol: nvidia_p2p_get_pages\n");
-		return -ENOENT;
-	}
-	p_nvidia_p2p_get_pages = (void *) addr;
-	mod_nvidia_p2p_get_pages = __module_text_address(addr);
-	if (mod_nvidia_p2p_get_pages)
-		__module_get(mod_nvidia_p2p_get_pages);
-	else
-		printk(KERN_NOTICE NVME_STROM_PREFIX
-			   "nvidia_p2p_get_pages is defined at core kernel?\n");
-
-	/* nvidia_p2p_put_pages */
-	addr = kallsyms_lookup_name("nvidia_p2p_put_pages");
-	if (!addr)
-	{
-		printk(KERN_ERR NVME_STROM_PREFIX
-			   "could not solve the symbol: nvidia_p2p_put_pages\n");
-		return -ENOENT;
-	}
-	p_nvidia_p2p_put_pages = (void *) addr;
-	mod_nvidia_p2p_put_pages = __module_text_address(addr);
-	if (mod_nvidia_p2p_put_pages)
-		__module_get(mod_nvidia_p2p_put_pages);
-	else
-		printk(KERN_NOTICE NVME_STROM_PREFIX
-			   "nvidia_p2p_put_pages is defined at core kernel?\n");
-	return 0;
-}
-
-/*
- * strom_update_extra_symbols
- *
- * update address of symbols that are not (officially) exported to module
- */
-static int
-strom_update_extra_symbols(struct notifier_block *nb,
-						   unsigned long action, void *data)
-{
-	unsigned long	addr;
-
-	if (!p_ext4_get_block)
-	{
-		addr = kallsyms_lookup_name("ext4_get_block");
-		if (addr)
-		{
-			mod_ext4_get_block = __module_text_address(addr);
-			if (mod_ext4_get_block)
-				__module_get(mod_ext4_get_block);
-			p_ext4_get_block = (void *) addr;
-			printk(KERN_INFO NVME_STROM_PREFIX
-				   "found ext4_get_block = %p\n", p_ext4_get_block);
-		}
-	}
-
-	if (!p_xfs_get_blocks)
-	{
-		addr = kallsyms_lookup_name("xfs_get_blocks");
-		if (addr)
-		{
-			mod_xfs_get_blocks = __module_text_address(addr);
-			if (mod_xfs_get_blocks)
-				__module_get(mod_xfs_get_blocks);
-			p_xfs_get_blocks = (void *) addr;
-			printk(KERN_INFO NVME_STROM_PREFIX
-				   "found xfs_get_blocks = %p\n", p_xfs_get_blocks);
-		}
-	}
-	return 0;
-}
-
 /* device file operations */
 static const struct file_operations nvme_strom_fops = {
 	.owner			= THIS_MODULE,
 	.open			= strom_proc_open,
-	.release		= strom_proc_release,
+	.read			= seq_read,
+	.llseek			= seq_lseek,
+	.release		= seq_release,
 	.unlocked_ioctl	= strom_proc_ioctl,
 	.compat_ioctl	= strom_proc_ioctl,
 };
 
-/* notifier for symbol resolver */
-static struct notifier_block nvme_strom_nb = {
-	.notifier_call	= strom_update_extra_symbols
-};
-
 int	__init nvme_strom_init(void)
 {
-	int		rc;
+	int		i, rc;
 
-	/* solve the mandatory symbols */
-	rc = strom_solve_extra_symbols();
-	if (rc)
-		return rc;
+	/* init strom_pgmem_mutex/slots */
+	for (i=0; i < PINNED_GPU_MEMORY_NSLOTS; i++)
+	{
+		mutex_init(&strom_pgmem_mutex[i]);
+		INIT_LIST_HEAD(&strom_pgmem_slots[i]);
+	}
 
 	/* make "/proc/nvme-strom" entry */
 	nvme_strom_proc = proc_create("nvme-strom",
@@ -849,29 +858,25 @@ int	__init nvme_strom_init(void)
 	if (!nvme_strom_proc)
 		return -ENOMEM;
 
-	rc = register_module_notifier(&nvme_strom_nb);
+	/* solve mandatory symbols */
+	rc = strom_init_extra_symbols();
 	if (rc)
-		goto out_1;
-	printk(KERN_INFO "/proc/nvme-strom registered\n");
-
+	{
+		proc_remove(nvme_strom_proc);
+		return rc;
+	}
+	printk(KERN_INFO NVME_STROM_PREFIX
+		   "/proc/nvme-strom entry was registered\n");
 	return 0;
-
-out_1:
-	proc_remove(nvme_strom_proc);
-	return rc;
 }
 module_init(nvme_strom_init);
 
 void __exit nvme_strom_exit(void)
 {
-	module_put(mod_nvidia_p2p_get_pages);
-	module_put(mod_nvidia_p2p_put_pages);
-	module_put(mod_ext4_get_block);
-	module_put(mod_xfs_get_blocks);
-
-	unregister_module_notifier(&nvme_strom_nb);
+	strom_exit_extra_symbols();
 	proc_remove(nvme_strom_proc);
-	printk(KERN_INFO "/proc/nvme-strom unregistered\n");
+	printk(KERN_INFO NVME_STROM_PREFIX
+		   "/proc/nvme-strom entry was unregistered\n");
 }
 module_exit(nvme_strom_exit);
 
