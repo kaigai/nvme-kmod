@@ -65,16 +65,23 @@ static int drivertest_check_file(const char *filename, int fdesc)
 	return rc;
 }
 
-static int drivertest_debug(const char *filename, int fdesc)
+static void drivertest_debug(const char *filename, int fdesc)
 {
-	StromCmd__Debug		uarg;
-	int		rc;
+	StromCmd__Debug	uarg;
+	struct stat		stbuf;
+	int				rc;
 
+	if (fstat(fdesc, &stbuf) != 0)
+	{
+		printf("failed on fstat(2): %m\n");
+		return;
+	}
 	uarg.fdesc = fdesc;
+	uarg.offset = 0;
+	uarg.length = stbuf.st_size;
 
 	rc = nvme_strom_ioctl(STROM_IOCTL__DEBUG, &uarg);
 	printf("STROM_IOCTL__DEBUG('%s') --> %d : %m\n", filename, rc);
-	return rc;
 }
 
 static int usage(char *argv0)

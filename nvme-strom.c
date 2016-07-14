@@ -8,6 +8,7 @@
  *
  */
 #include <asm/uaccess.h>
+#include <linux/buffer_head.h>
 #include <linux/crc32c.h>
 #include <linux/file.h>
 #include <linux/fs.h>
@@ -419,6 +420,10 @@ strom_ioctl_info_gpu_memory(StromCmd__InfoGpuMemory __user *uarg)
  * - block device of the file has to be NVMe-SSD, managed by the inbox
  *   driver of Linux. RAID configuration is not available to use.
  */
+#define STROM_FS_TYPE_EXT3		0xEF53		/* EXT3_SUPER_MAGIC */
+#define STROM_FS_TYPE_EXT4		0xEF53		/* EXT4_SUPER_MAGIC */
+#define STROM_FS_TYPE_XFS		0x58465342	/* XFS_SB_MAGIC */
+
 static int
 source_file_is_supported(struct file *filp)
 {
@@ -428,6 +433,7 @@ source_file_is_supported(struct file *filp)
 	struct file_system_type *s_type = i_sb->s_type;
 	struct gendisk		   *bd_disk = s_bdev->bd_disk;
 	const char			   *dname;
+	int						fs_type;
 	int						rc;
 
 	/*
@@ -452,10 +458,25 @@ source_file_is_supported(struct file *filp)
 	 *
 	 * supported: ext4, xfs
 	 */
-	if (!((strcmp(s_type->name, "ext4") == 0 &&
-		   s_type->owner == mod_ext4_get_block) ||
-		  (strcmp(s_type->name, "xfs") == 0 &&
-		   s_type->owner == mod_xfs_get_blocks)))
+	if (strcmp(s_type->name, "ext4") == 0 &&
+		s_type->owner == mod_ext4_get_block)
+	{
+#if 0
+		/* needs a copy&paste? */
+		if (ext4_has_inline_data(filp->f_inode))
+		{
+			printk(KERN_INFO NVME_STROM_PREFIX "file has inline data\n");
+			return -ENOTSUPP;
+		}
+#endif
+		fs_type = STROM_FS_TYPE_EXT4;
+	}
+	else if (strcmp(s_type->name, "xfs") == 0 &&
+			 s_type->owner == mod_xfs_get_blocks)
+	{
+		fs_type = STROM_FS_TYPE_XFS;
+	}
+	else
 	{
 		printk(KERN_INFO NVME_STROM_PREFIX
 			   "file_system_type name=%s, not supported", s_type->name);
@@ -527,7 +548,7 @@ source_file_is_supported(struct file *filp)
 	}
 
 	/* OK, we assume the underlying device is supported NVMe-SSD */
-	return 0;
+	return fs_type;
 }
 
 /*
@@ -553,7 +574,7 @@ strom_ioctl_check_file(StromCmd__CheckFile __user *uarg)
 
 	fput(filp);
 
-	return rc;
+	return (rc < 0 ? rc : 0);
 }
 
 /* ================================================================
@@ -714,7 +735,7 @@ strom_memcpy_ssd2gpu_async(StromCmd__MemCpySsdToGpu __user *uarg)
 			return (unsigned long)(-EBADF);
 		}
 		rc = source_file_is_supported(filp);
-		if (rc)
+		if (rc < 0)
 			goto error_1;
 	}
 
@@ -901,6 +922,7 @@ strom_ioctl_debug(StromCmd__Debug __user *uarg)
 	struct file	   *filp;
 	struct page	   *page;
 	int				rc;
+	int				fs_type;
 	unsigned long	pos;
 	unsigned long	ofs;
 	unsigned long	end;
@@ -913,36 +935,45 @@ strom_ioctl_debug(StromCmd__Debug __user *uarg)
 	if (!filp)
 		return 0;
 
-	rc = source_file_is_supported(filp);
-	if (rc)
+	fs_type = source_file_is_supported(filp);
+	if (fs_type < 0)
 	{
 		fput(filp);
-		return rc;
+		return fs_type;
 	}
 
-	pos = karg.offset & ~PAGE_MASK;
+	pos = karg.offset >> PAGE_CACHE_SHIFT;
 	ofs = karg.offset &  PAGE_MASK;
-	end = karg.offset + karg.length;
+	end = (karg.offset + karg.length) >> PAGE_CACHE_SHIFT;
 
 	while (pos < end)
 	{
+		struct buffer_head	*bh;
+
 		page = find_get_page(filp->f_mapping, pos);
 		printk(KERN_INFO "file offset=%lu page cache=%p\n", pos, page);
+		if (page)
+		{
+			bh = create_page_buffers(page, filp->f_inode, 0);
+			
+			if (!buffer_mapped(bh))
+			{
+				rc = __ext4_get_block(filp->f_inode, pos, bh, 0);
 
-		__ext4_get_block(filp->f_inode, pos,
-						 &bh, 0);
-
-
-		__ext4_get_block(struct inode *inode, sector_t offset,
-						 struct buffer_head *bh, int create)
-
-
-
-
-
-		put_page(page);
-
-		pos += PAGE_SIZE;
+				if (rc < 0)
+					printk(KERN_INFO "ext4_get_block = %d\n", rc);
+				else
+				{
+					printk(KERN_INFO
+						   "bh {b_state=%lu b_this_page=%p b_page=%p "
+						   "b_blocknr=%lu b_size=%lu b_bdev=%p}\n",
+						   bh->b_state, bh->b_this_page, bh->b_page,
+						   bh->b_blocknr, bh->b_size, bh->b_bdev);
+				}
+			}
+			put_page(page);
+		}
+		pos++;
 	}
 	fput(filp);
 
