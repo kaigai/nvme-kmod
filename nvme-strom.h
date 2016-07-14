@@ -11,50 +11,79 @@
 #include <asm/ioctl.h>
 
 enum {
-	STROM_IOCTL_CHECK_SUPPORTED		= _IO('S',0x80),
-	STROM_IOCTL_PIN_GPU_MEMORY		= _IO('S',0x81),
-	STROM_IOCTL_UNPIN_GPU_MEMORY	= _IO('S',0x82),
-	STROM_IOCTL_DMA_SSD2GPU			= _IO('S',0x83),
-	STROM_IOCTL_DEBUG				= _IO('S',0x99),
+	STROM_IOCTL__CHECK_FILE			= _IO('S',0x80),
+	STROM_IOCTL__MAP_GPU_MEMORY		= _IO('S',0x81),
+	STROM_IOCTL__UNMAP_GPU_MEMORY	= _IO('S',0x82),
+	STROM_IOCTL__INFO_GPU_MEMORY	= _IO('S',0x83),
+	STROM_IOCTL__DMA_SSD2GPU		= _IO('S',0x84),
+	STROM_IOCTL__DMA_SSD2GPU_ASYNC	= _IO('S',0x85),
+	STROM_IOCTL__DMA_SSD2GPU_WAIT	= _IO('S',0x86),
+	STROM_IOCTL__DEBUG				= _IO('S',0x87),
 };
 
-/* STROM_IOCTL_CHECK_SUPPORTED */
-typedef struct
+/* STROM_IOCTL__CHECK_FILE */
+struct StromCmd__CheckFile
 {
-	unsigned int	fdesc;		/* in: file descriptor to be checked */
-} StromCmd__CheckSupported;
+	int				fdesc;		/* in: file descriptor to be checked */
+};
+typedef struct StromCmd__CheckFile		StromCmd__CheckFile;
 
-/* STROM_IOCTL_PIN_GPU_MEMORY */
-typedef struct
+/* STROM_IOCTL__MAP_GPU_MEMORY */
+struct StromCmd__MapGpuMemory
 {
-	uint64_t		address;	/* in: address of the device memory */
+	unsigned long	handle;		/* out: handler of the mapped region */
+	uint64_t		vaddress;	/* in: virtual address of the device memory */
 	size_t			length;		/* in: length of the device memory */
-	unsigned long	handle;		/* out: identifier of this mapping */
-} StromCmd__PinGpuMemory;
+};
+typedef struct StromCmd__MapGpuMemory	StromCmd__MapGpuMemory;
 
-/* STROM_IOCTL_UNPIN_GPU_MEMORY */
-typedef struct
+/* STROM_IOCTL__UNMAP_GPU_MEMORY */
+struct StromCmd__UnmapGpuMemory
 {
-	unsigned long	handle;		/* in: identifier to be unpinned */
-} StromCmd__UnpinGpuMemory;
+	unsigned long	handle;		/* in: handler of the mapped region */
+};
+typedef struct StromCmd__UnmapGpuMemory	StromCmd__UnmapGpuMemory;
 
-/* STROM_IOCTL_P2PDMA_SSD2GPU */
-typedef struct
+/* STROM_IOCTL__INFO_GPU_MEMORY */
+struct StromCmd__InfoGpuMemory
 {
-	unsigned long	handle;		/* in: handle of pinned gpu memory */
-	size_t			offset;		/* in: destination offset of the GPU memory */
-	unsigned int	fdesc;		/* in: file descriptor */
-	unsigned int	n_chunks;	/* in: number of source chunks */
+	unsigned long	handle;		/* in: handler of the mapped region */
+	uint32_t		nrooms;		/* in: length of the variable length array */
+	uint32_t		version;	/* out: 'version' of p2p_page_table */
+	uint32_t		page_size;	/* out: 'page_size' of p2p_page_table */
+	uint32_t		entries;	/* out: 'entries' of p2p_page_table */
+	uint64_t		physical_address[1];
+};
+typedef struct StromCmd__InfoGpuMemory	StromCmd__InfoGpuMemory;
+
+/* STROM_IOCTL__DMA_SSD2GPU and STROM_IOCTL__DMA_SSD2GPU_ASYNC */
+struct StromCmd__DmaSsd2Gpu
+{
+	unsigned long	dma_id;		/* out: ID of this DMA operation */
+	unsigned long	handle;		/* in: handler of the mapped region */
+	size_t			offset;		/* in: destination offset from the head of
+								 *     this mapped region */
+	int				fdesc;		/* in: file descriptor, if any. Or, -1 */
+	int				nchunks;	/* in: number of the source chunks */
 	struct {
 		union {
 			size_t	foffset;	/* in: file offset of this chunk */
-			void   *vaddr;		/* in: host vaddress of this chunk */
+			void   *mem_addr;	/* in: host memory address of this chunk */
 		} u;
-		long		length;		/* in: absolete length of this chunk.
-								 *     positive means File -> GPU DMA
-								 *     negative means Host -> GPU DMA */
-	} chunks[1];				/* variable length */
-} StromCmd__MemcpySsd2Gpu;
+		char		source;		/* in: source of this chunk
+								 *     'f' --> the source file
+								 *     'm' --> host memory
+								 */
+		unsigned int length;	/* in: length of this chunk */
+	} chunks[1];	/* ...variable length structure... */
+};
+typedef struct StromCmd__DmaSsd2Gpu		StromCmd__DmaSsd2Gpu;
+
+/* STROM_IOCTL__DMA_SSD2GPU_WAIT */
+typedef struct
+{
+	unsigned long	dma_id;		/* in: ID of the DMA operation to wait */
+} StromCmd__DmaSsd2GpuWait;
 
 /* STROM_IOCTL_DEBUG */
 typedef struct

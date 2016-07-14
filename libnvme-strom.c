@@ -53,15 +53,15 @@ nvme_strom_ioctl(int cmd, const void *arg)
 
 #ifdef BUILD_AS_DRIVERTEST
 
-static int drivertest_check_supported(const char *filename, int fdesc)
+static int drivertest_check_file(const char *filename, int fdesc)
 {
-	StromCmd__CheckSupported	uarg;
+	StromCmd__CheckFile uarg;
 	int		rc;
 
 	uarg.fdesc = fdesc;
 
-	rc = nvme_strom_ioctl(STROM_IOCTL_CHECK_SUPPORTED, &uarg);
-	printf("STROM_IOCTL_CHECK_SUPPORTED('%s') --> %d : %m\n", filename, rc);
+	rc = nvme_strom_ioctl(STROM_IOCTL__CHECK_FILE, &uarg);
+	printf("STROM_IOCTL__CHECK_FILE('%s') --> %d : %m\n", filename, rc);
 	return rc;
 }
 
@@ -72,8 +72,8 @@ static int drivertest_debug(const char *filename, int fdesc)
 
 	uarg.fdesc = fdesc;
 
-	rc = nvme_strom_ioctl(STROM_IOCTL_DEBUG, &uarg);
-	printf("STROM_IOCTL_DEBUG('%s') --> %d : %m\n", filename, rc);
+	rc = nvme_strom_ioctl(STROM_IOCTL__DEBUG, &uarg);
+	printf("STROM_IOCTL__DEBUG('%s') --> %d : %m\n", filename, rc);
 	return rc;
 }
 
@@ -119,7 +119,7 @@ int main(int argc, char * const argv[])
 	}
 
 	if (do_check_supported)
-		drivertest_check_supported(filename, fdesc);
+		drivertest_check_file(filename, fdesc);
 	else
 		drivertest_debug(filename, fdesc);
 	
