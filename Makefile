@@ -1,7 +1,8 @@
 KERNEL_UNAME := $(shell uname -r)
 KERNEL_SOURCE := /lib/modules/$(KERNEL_UNAME)/build
 
-NVIDIA_SOURCE := $(shell ls -drSt /usr/src/nvidia-* | grep -E '.*/nvidia-[0-9\.]+$$' | head -1)
+NVIDIA_SOURCE := $(shell ls -St /usr/src/nvidia-*/nv-p2p.h | \
+                         sed 's/\/nv-p2p\.h$$//g' | head -1)
 
 CUDA_PATH_LIST := /usr/local/cuda /usr/local/cuda-*
 CUDA_PATH := $(shell for x in $(CUDA_PATH_LIST);    \
