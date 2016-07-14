@@ -459,7 +459,7 @@ source_file_is_supported(struct file *filp)
 	{
 		printk(KERN_INFO NVME_STROM_PREFIX
 			   "file_system_type name=%s, not supported", s_type->name);
-		return 1;	/* not supported filesystem */
+		return -ENOTSUPP;
 	}
 
 	/*
@@ -475,7 +475,7 @@ source_file_is_supported(struct file *filp)
 		printk(KERN_INFO NVME_STROM_PREFIX
 			   "block device major number = %d, not 'blkext'\n",
 			   bd_disk->major);
-		return 1;
+		return -ENOTSUPP;
 	}
 
 	/* disk_name should be 'nvme%dn%d' */
@@ -505,7 +505,7 @@ source_file_is_supported(struct file *filp)
 	{
 		printk(KERN_INFO NVME_STROM_PREFIX
 			   "block device '%s' is not supported", dname);
-		return 1;
+		return -ENOTSUPP;
 	}
 
 	/* try to call ioctl */
@@ -514,7 +514,7 @@ source_file_is_supported(struct file *filp)
 		printk(KERN_INFO NVME_STROM_PREFIX
 			   "block device '%s' does not provide ioctl\n",
 			   bd_disk->disk_name);
-		return 1;
+		return -ENOTSUPP;
 	}
 
 	rc = bd_disk->fops->ioctl(s_bdev, 0, NVME_IOCTL_ID, 0UL);
@@ -523,7 +523,7 @@ source_file_is_supported(struct file *filp)
 		printk(KERN_INFO NVME_STROM_PREFIX
 			   "ioctl(NVME_IOCTL_ID) on '%s' returned an error: %d\n",
 			   bd_disk->disk_name, rc);
-		return 1;
+		return -ENOTSUPP;
 	}
 
 	/* OK, we assume the underlying device is supported NVMe-SSD */
@@ -637,15 +637,48 @@ strom_cleanup_dma_task(unsigned long dma_task_id)
 static int
 __strom_memcpy_ssd2gpu_async(strom_dma_task *dtask)
 {
+#if 0
+	struct file	   *filp = dtask->filp;
+	struct page	   *page;
+	int				i, j;
 
+	for (i=0; i < dtask->nchunks; i++)
+	{
+		strom_dma_chunk *dchunk = &dtask->chunks[i];
 
+		if (dchunk->source == 'm')
+		{
+			/* CPU RAM --> GPU RAM DMA */
+			/* We can kick DMA at once */
+		}
+		else if (dchunk->source == 'f')
+		{
+			if (!filp)
+				/* no file handler */;
 
+			pos = dchunk->file_pos & ~PAGE_MASK;
+			ofs = dchunk->file_pos &  PAGE_MASK;
+			end = dchunk->file_pos + length;
+			while (pos < end)
+			{
+				page = find_get_page(filp->f_mapping, pos);
+				if (page)
+				{
+					/* Page Cache --> GPU RAM DMA */
+					
+				}
+				else
+				{
+					/* NVMe SSD --> GPU RAM DMA */
+					
+				}
+			}
+		}
+		else
+			/* invalid source */;
+	}
 
-
-
-
-
-
+#endif
 	strom_cleanup_dma_task(dtask->dma_task_id);
 
 	return -EINVAL;
@@ -864,13 +897,13 @@ strom_ioctl_memcpy_ssd2gpu_wait(StromCmd__MemCpySsdToGpuWait __user *uarg)
 static int
 strom_ioctl_debug(StromCmd__Debug __user *uarg)
 {
-	StromCmd__Debug		karg;
-	struct file		   *filp;
-	struct inode	   *f_inode;
-	struct super_block *i_sb;
-    struct address_space *i_mapping;
-	struct block_device *s_bdev;
-	struct gendisk	   *bd_disk;
+	StromCmd__Debug	karg;
+	struct file	   *filp;
+	struct page	   *page;
+	int				rc;
+	unsigned long	pos;
+	unsigned long	ofs;
+	unsigned long	end;
 
 	if (copy_from_user(&karg, uarg, sizeof(StromCmd__Debug)))
 		return -EFAULT;
@@ -880,35 +913,37 @@ strom_ioctl_debug(StromCmd__Debug __user *uarg)
 	if (!filp)
 		return 0;
 
-	f_inode = filp->f_inode;
-	printk(KERN_INFO "filp->f_inode = %p\n", f_inode);
-	if (!f_inode)
-		goto out;
+	rc = source_file_is_supported(filp);
+	if (rc)
+	{
+		fput(filp);
+		return rc;
+	}
 
-	i_sb = f_inode->i_sb;
-	i_mapping = f_inode->i_mapping;
+	pos = karg.offset & ~PAGE_MASK;
+	ofs = karg.offset &  PAGE_MASK;
+	end = karg.offset + karg.length;
 
-	printk(KERN_INFO "f_inode {i_sb = %p, i_mapping = %p}\n", i_sb, i_mapping);
-	if (!i_sb)
-		goto out;
+	while (pos < end)
+	{
+		page = find_get_page(filp->f_mapping, pos);
+		printk(KERN_INFO "file offset=%lu page cache=%p\n", pos, page);
 
-	s_bdev = i_sb->s_bdev;
-	printk(KERN_INFO "i_sb {s_dev = %x s_bdev = %p}\n", i_sb->s_dev, s_bdev);
+		__ext4_get_block(filp->f_inode, pos,
+						 &bh, 0);
 
-	if (!s_bdev)
-		goto out;
-	printk(KERN_INFO "s_bdev {bd_inode=%p bd_block_size=%u bd_disk=%p}\n",
-		   s_bdev->bd_inode, s_bdev->bd_block_size, s_bdev->bd_disk);
 
-	bd_disk = s_bdev->bd_disk;
-	if (!bd_disk)
-		goto out;
+		__ext4_get_block(struct inode *inode, sector_t offset,
+						 struct buffer_head *bh, int create)
 
-	printk(KERN_INFO "bd_disk {major=%d first_minor=%d minors=%d disk_name=%s fops=%p",
-		   bd_disk->major, bd_disk->first_minor, bd_disk->minors, bd_disk->disk_name, bd_disk->fops);
-		   
 
-out:
+
+
+
+		put_page(page);
+
+		pos += PAGE_SIZE;
+	}
 	fput(filp);
 
 	return 0;

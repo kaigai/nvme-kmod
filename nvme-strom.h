@@ -89,7 +89,9 @@ typedef struct
 /* STROM_IOCTL_DEBUG */
 typedef struct
 {
-	unsigned int	fdesc;		/* in: file descriptor */
+	int				fdesc;		/* in: file descriptor */
+	unsigned long	offset;
+	unsigned long	length;
 } StromCmd__Debug;
 
 
