@@ -142,6 +142,9 @@ strom_get_mapped_gpu_memory(unsigned long handle)
 	}
 	mutex_unlock(mutex);
 
+	printk(KERN_ERR NVME_STROM_PREFIX
+		   "P2P GPU Memory (handle=%lu) not found\n", handle);
+
 	return NULL;	/* not found */
 }
 
@@ -299,9 +302,11 @@ strom_ioctl_map_gpu_memory(StromCmd__MapGpuMemory __user *uarg)
 	}
 
 	/* return the handle of mapped_gpu_memory */
-	rc = put_user(mgmem->handle, &uarg->handle);
-	if (rc)
+	if (put_user(mgmem->handle, &uarg->handle))
+	{
+		rc = -EFAULT;
 		goto error_2;
+	}
 
 	/* debug output */
 	{
@@ -565,84 +570,288 @@ strom_ioctl_check_file(StromCmd__CheckFile __user *uarg)
  *
  * ================================================================
  */
-struct dma_ssd2gpu
+struct strom_dma_task
 {
 	struct list_head	chain;
-	unsigned long		dma_id;	/* ID of this DMA task */
-	mapped_gpu_memory  *mgmem;	/* destination GPU memory segment */
-
-
-
+	unsigned long		dma_task_id;/* ID of this DMA task */
+	mapped_gpu_memory  *mgmem;		/* destination GPU memory segment */
+	struct file		   *filp;		/* source file, if any */
+	struct task_struct *wait_task;	/* task which wait for completion */
+	unsigned int		nchunks;
+	strom_dma_chunk		chunks[1];
 };
+typedef struct strom_dma_task	strom_dma_task;
 
+#define STROM_DMA_TASK_NSLOTS	100
+static struct mutex		strom_dma_task_mutex[STROM_DMA_TASK_NSLOTS];
+static struct list_head	strom_dma_task_slots[STROM_DMA_TASK_NSLOTS];
 
-
-static int
-strom_ioctl_dma_ssd2gpu(StromCmd__DmaSsd2Gpu __user *uarg)
+/*
+ * strom_dma_task_index
+ */
+static inline int
+strom_dma_task_index(unsigned long dma_task_id)
 {
-	//async + wait;
-	return 0;
+	u32		hash = arch_fast_hash(&dma_task_id, sizeof(unsigned long),
+								  0x20120106);
+	return hash % STROM_DMA_TASK_NSLOTS;
 }
 
-static int
-strom_ioctl_dma_ssd2gpu_async(StromCmd__DmaSsd2Gpu __user *uarg)
+/*
+ * strom_cleanup_dma_task
+ */
+static void
+strom_cleanup_dma_task(unsigned long dma_task_id)
 {
-	return 0;
+	int					index = strom_dma_task_index(dma_task_id);
+	struct mutex	   *mutex = &strom_dma_task_mutex[index];
+	struct list_head   *slot = &strom_dma_task_slots[index];
+	strom_dma_task	   *dtask;
+
+	mutex_lock(mutex);
+	list_for_each_entry(dtask, slot, chain)
+	{
+		if (dtask->dma_task_id != dma_task_id)
+			continue;
+
+		list_del(&dtask->chain);
+		mutex_unlock(mutex);
+		/* release relevant resources */
+		strom_put_mapped_gpu_memory(dtask->mgmem);
+		if (dtask->filp)
+			fput(dtask->filp);
+		if (dtask->wait_task)
+			wake_up_process(dtask->wait_task);
+		kfree(dtask);
+		return;
+	}
+	mutex_unlock(mutex);
+
+	printk(KERN_ERR NVME_STROM_PREFIX
+		   "P2P DMA Task (dma_task_id=%lu) not found\n", dma_task_id);
 }
 
+/*
+ * __strom_memcpy_ssd2gpu_async
+ */
 static int
-strom_ioctl_dma_ssd2gpu_wait(StromCmd__DmaSsd2GpuWait __user *uarg)
+__strom_memcpy_ssd2gpu_async(strom_dma_task *dtask)
 {
-	return 0;
+
+
+
+
+
+
+
+
+
+	strom_cleanup_dma_task(dtask->dma_task_id);
+
+	return -EINVAL;
 }
 
-#if 0
-static int
-strom_ioctl_dma_ssd2gpu(StromCmd__MemcpySsd2Gpu __user *uarg)
+/*
+ * strom_memcpy_ssd2gpu_async
+ */
+static unsigned long
+strom_memcpy_ssd2gpu_async(StromCmd__MemCpySsdToGpu __user *uarg)
 {
-	StromCmd__MemcpySsd2Gpu karg;
-	pinned_gpu_memory  *pgmem;
-	struct file		   *filp;
-	int					rc = 0;
+	StromCmd__MemCpySsdToGpu karg;
+	mapped_gpu_memory  *mgmem;
+	strom_dma_task	   *dtask;
+	struct file		   *filp = NULL;
+	unsigned long		dma_task_id;
+	int					index;
+	int					rc;
 
 	if (copy_from_user(&karg, uarg,
-					   offsetof(StromCmd__MemcpySsd2Gpu, chunks)))
-		return -EFAULT;
+					   offsetof(StromCmd__MemCpySsdToGpu, chunks)))
+		return (unsigned long)(-EFAULT);
 
-	pgmem = strom_get_pinned_memory(karg.handle);
-	if (!pgmem)
+	/* ensure file is supported, if required */
+	if (karg.fdesc >= 0)
 	{
-		printk(KERN_ERR NVME_STROM_PREFIX
-			   "Pinned GPU Memory (handle=%lu) not found\n", karg.handle);
-		return -ENOENT;
+		filp = fget(karg.fdesc);
+		if (!filp)
+		{
+			printk(KERN_ERR NVME_STROM_PREFIX
+				   "file descriptor %d of process %u is not available\n",
+				   karg.fdesc, current->tgid);
+			return (unsigned long)(-EBADF);
+		}
+		rc = source_file_is_supported(filp);
+		if (rc)
+			goto error_1;
 	}
 
-	filp = fget(karg.fdesc);
-	if (!filp)
+	/* get destination GPU memory */
+	mgmem = strom_get_mapped_gpu_memory(karg.handle);
+	if (!mgmem)
 	{
-		printk(KERN_ERR NVME_STROM_PREFIX
-			   "File descriptor %d not found\n", karg.fdesc);
-		rc = -EBADF;
-		goto out_1;
+		rc = -ENOENT;
+		goto error_1;
 	}
 
-	rc = source_file_is_supported(filp);
+	/* make strom_dma_task object */
+	dtask = kmalloc(offsetof(strom_dma_task,
+							 chunks[karg.nchunks]), GFP_KERNEL);
+	if (!dtask)
+	{
+		rc = -ENOMEM;
+		goto error_2;
+	}
+	dma_task_id = (unsigned long) dtask;
+
+	dtask->dma_task_id = dma_task_id;
+	dtask->mgmem = mgmem;
+	dtask->filp = filp;
+	dtask->wait_task = NULL;
+	dtask->nchunks = karg.nchunks;
+	if (copy_from_user(dtask->chunks, uarg->chunks,
+					   sizeof(strom_dma_chunk) * karg.nchunks))
+	{
+		rc = -EFAULT;
+		goto error_3;
+	}
+
+	/* registration of the strom_dma_task */
+	index = strom_dma_task_index(dtask->dma_task_id);
+	mutex_lock(&strom_dma_task_mutex[index]);
+	list_add(&strom_dma_task_slots[index], &dtask->chain);
+	mutex_unlock(&strom_dma_task_mutex[index]);
+
+	/*
+	 * kick asynchronous DMA operation
+	 *
+	 * NOTE: Once asynchronous operation successfully kicked, nobody can
+	 * guarantee existence of 'dtask' object outside of the mutex, because
+	 * asynchronous callback may detach object and release it.
+	 * So, further error shall be handled by __strom_memcpy_ssd2gpu_async.
+	 */
+	rc = __strom_memcpy_ssd2gpu_async(dtask);
 	if (rc)
-		goto out_2;
+		return (unsigned long) rc;
 
-	/* OK, try to kick P2P DMA */
+	return dma_task_id;
 
+error_3:
+	kfree(dtask);
+error_2:
+	strom_put_mapped_gpu_memory(mgmem);
+error_1:
+	if (filp)
+		fput(filp);
+	return (unsigned long) rc;
+}
 
+/*
+ * strom_memcpy_ssd2gpu_wait - synchronization of a dma_task
+ */
+static int
+strom_memcpy_ssd2gpu_wait(unsigned long dma_task_id)
+{
+	struct mutex	   *mutex;
+	struct list_head   *slot;
+	struct task_struct *wait_task_saved;
+	strom_dma_task	   *dtask;
+	int					index;
 
-	/* release resources */
-out_2:
-	fput(filp);
-out_1:
-	strom_put_pinned_memory(pgmem);
+	index = strom_dma_task_index(dma_task_id);
+	mutex = &strom_dma_task_mutex[index];
+	slot  = &strom_dma_task_slots[index];
 
+	mutex_lock(mutex);
+	list_for_each_entry(dtask, slot, chain)
+	{
+		if (dtask->dma_task_id != dma_task_id)
+			continue;
+
+		wait_task_saved = dtask->wait_task;
+		dtask->wait_task = current;
+
+		/* sleep until DMA completion */
+		set_current_state(TASK_UNINTERRUPTIBLE);
+		mutex_unlock(mutex);
+		schedule();
+
+		if (wait_task_saved)
+			wake_up_process(wait_task_saved);
+#if 1
+		/* for debug, ensure dma_task has already gone */
+		mutex_lock(mutex);
+		list_for_each_entry(dtask, slot, chain)
+		{
+			BUG_ON(dtask->dma_task_id == dma_task_id);
+		}
+		mutex_unlock(mutex);
+#endif
+		return 0;
+	}
+	mutex_unlock(mutex);
+
+	/*
+	 * DMA task was not found. Likely, asynchronous DMA task gets already
+	 * completed.
+	 */
+	return -ENOENT;
+}
+
+/*
+ * ioctl(2) handler for STROM_IOCTL__MEMCPY_SSD2GPU
+ */
+static int
+strom_ioctl_memcpy_ssd2gpu(StromCmd__MemCpySsdToGpu __user *uarg)
+{
+	unsigned long	dma_task_id = strom_memcpy_ssd2gpu_async(uarg);
+	int				rc = 0;
+
+	if (IS_ERR_VALUE(dma_task_id))
+		rc = (long) dma_task_id;
+	else
+	{
+		if (put_user(dma_task_id, &uarg->dma_task_id))
+			rc = -EFAULT;
+		(void) strom_memcpy_ssd2gpu_wait(dma_task_id);
+	}
 	return rc;
 }
-#endif
+
+/*
+ * ioctl(2) handler for STROM_IOCTL__MEMCPY_SSD2GPU_ASYNC
+ */
+static int
+strom_ioctl_memcpy_ssd2gpu_async(StromCmd__MemCpySsdToGpu __user *uarg)
+{
+	unsigned long	dma_task_id = strom_memcpy_ssd2gpu_async(uarg);
+	int				rc = 0;
+
+	if (IS_ERR_VALUE(dma_task_id))
+        rc = (long) dma_task_id;
+	else
+	{
+		if (put_user(dma_task_id, &uarg->dma_task_id))
+		{
+			rc = -EFAULT;
+			(void) strom_memcpy_ssd2gpu_wait(dma_task_id);
+		}
+	}
+	return rc;
+}
+
+/*
+ * ioctl(2) handler for STROM_IOCTL__MEMCPY_SSD2GPU_WAIT
+ */
+static int
+strom_ioctl_memcpy_ssd2gpu_wait(StromCmd__MemCpySsdToGpuWait __user *uarg)
+{
+	StromCmd__MemCpySsdToGpuWait karg;
+
+	if (copy_from_user(&karg, uarg, sizeof(karg)))
+		return -EFAULT;
+
+	return strom_memcpy_ssd2gpu_wait(karg.dma_task_id);
+}
 
 /* ================================================================
  *
@@ -836,16 +1045,16 @@ strom_proc_ioctl(struct file *filp,
 			rc = strom_ioctl_info_gpu_memory((void __user *) arg);
 			break;
 
-		case STROM_IOCTL__DMA_SSD2GPU:
-			rc = strom_ioctl_dma_ssd2gpu((void __user *) arg);
+		case STROM_IOCTL__MEMCPY_SSD2GPU:
+			rc = strom_ioctl_memcpy_ssd2gpu((void __user *) arg);
 			break;
 
-		case STROM_IOCTL__DMA_SSD2GPU_ASYNC:
-			rc = strom_ioctl_dma_ssd2gpu_async((void __user *) arg);
+		case STROM_IOCTL__MEMCPY_SSD2GPU_ASYNC:
+			rc = strom_ioctl_memcpy_ssd2gpu_async((void __user *) arg);
 			break;
 
-		case STROM_IOCTL__DMA_SSD2GPU_WAIT:
-			rc = strom_ioctl_dma_ssd2gpu_wait((void __user *) arg);
+		case STROM_IOCTL__MEMCPY_SSD2GPU_WAIT:
+			rc = strom_ioctl_memcpy_ssd2gpu_wait((void __user *) arg);
 			break;
 
 		case STROM_IOCTL__DEBUG:
@@ -879,6 +1088,13 @@ int	__init nvme_strom_init(void)
 	{
 		mutex_init(&strom_mgmem_mutex[i]);
 		INIT_LIST_HEAD(&strom_mgmem_slots[i]);
+	}
+
+	/* init strom_dma_task_mutex/slots */
+	for (i=0; i < STROM_DMA_TASK_NSLOTS; i++)
+	{
+		mutex_init(&strom_dma_task_mutex[i]);
+		INIT_LIST_HEAD(&strom_dma_task_slots[i]);
 	}
 
 	/* make "/proc/nvme-strom" entry */
