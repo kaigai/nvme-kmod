@@ -49,9 +49,9 @@ struct StromCmd__InfoGpuMemory
 {
 	unsigned long	handle;		/* in: handler of the mapped region */
 	uint32_t		nrooms;		/* in: length of the variable length array */
-	uint32_t		version;	/* out: 'version' of p2p_page_table */
-	uint32_t		page_size;	/* out: 'page_size' of p2p_page_table */
-	uint32_t		entries;	/* out: 'entries' of p2p_page_table */
+	uint32_t		version;	/* out: 'version' of the page tables */
+	uint32_t		page_size;	/* out: 'page_size' in bytes */
+	uint32_t		entries;	/* out: num of physical_address[] entries */
 	uint64_t		physical_address[1];
 };
 typedef struct StromCmd__InfoGpuMemory	StromCmd__InfoGpuMemory;

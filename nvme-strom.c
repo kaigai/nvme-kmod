@@ -76,6 +76,9 @@ struct mapped_gpu_memory
 	unsigned long		map_offset;	/* offset from the H/W page boundary */
 	unsigned long		map_length;	/* length of the mapped area */
 	struct task_struct *wait_task;	/* task waiting for DMA completion */
+	size_t				page_size;	/* page-size in bytes; note that
+									 * 'page_size' of nvidia_p2p_page_table_t
+									 * is one of NVIDIA_P2P_PAGE_SIZE_* */
 	nvidia_p2p_page_table_t *page_table;
 
 	/*
@@ -144,7 +147,7 @@ strom_get_mapped_gpu_memory(unsigned long handle)
 	mutex_unlock(mutex);
 
 	printk(KERN_ERR NVME_STROM_PREFIX
-		   "P2P GPU Memory (handle=%lu) not found\n", handle);
+		   "P2P GPU Memory (handle=0x%lx) not found\n", handle);
 
 	return NULL;	/* not found */
 }
@@ -233,17 +236,17 @@ __strom_clenup_mapped_gpu_memory(unsigned long handle)
 		rc = __nvidia_p2p_free_page_table(mgmem->page_table);
 		if (rc)
 			printk(KERN_ERR NVME_STROM_PREFIX
-				   "nvidia_p2p_free_page_table (handle=%lu, rc=%d)\n",
+				   "nvidia_p2p_free_page_table (handle=0x%lx, rc=%d)\n",
 				   handle, rc);
 		kfree(mgmem);
 
 		printk(KERN_ERR NVME_STROM_PREFIX
-			   "P2P GPU Memory (handle=%lu) was released\n", handle);
+			   "P2P GPU Memory (handle=%p) was released\n", (void *)handle);
 		return 0;
 	}
 	mutex_unlock(mutex);
 	printk(KERN_ERR NVME_STROM_PREFIX
-		   "P2P GPU Memory (handle=%lu) already released\n", handle);
+		   "P2P GPU Memory (handle=%p) already released\n", (void *)handle);
 	return -ENOENT;
 }
 
@@ -302,6 +305,23 @@ strom_ioctl_map_gpu_memory(StromCmd__MapGpuMemory __user *uarg)
 		goto error_1;
 	}
 
+	/* page size in bytes */
+	switch (mgmem->page_table->page_size)
+	{
+		case NVIDIA_P2P_PAGE_SIZE_4KB:
+			mgmem->page_size = 4 * 1024;
+			break;
+		case NVIDIA_P2P_PAGE_SIZE_64KB:
+			mgmem->page_size = 64 * 1024;
+			break;
+		case NVIDIA_P2P_PAGE_SIZE_128KB:
+			mgmem->page_size = 128 * 1024;
+			break;
+		default:
+			rc = -EINVAL;
+			goto error_2;
+	}
+
 	/* return the handle of mapped_gpu_memory */
 	if (put_user(mgmem->handle, &uarg->handle))
 	{
@@ -314,17 +334,17 @@ strom_ioctl_map_gpu_memory(StromCmd__MapGpuMemory __user *uarg)
 		nvidia_p2p_page_table_t *page_table = mgmem->page_table;
 
 		printk(KERN_INFO NVME_STROM_PREFIX
-			   "P2P GPU Memory (handle=%lu) was mapped\n"
-			   "  version=%u, page_size=%u, entries=%u\n",
-			   mgmem->handle,
+			   "P2P GPU Memory (handle=%p) mapped\n"
+			   "  version=%u, page_size=%zu, entries=%u\n",
+			   (void *)mgmem->handle,
 			   page_table->version,
-			   page_table->page_size,
+			   mgmem->page_size,
 			   page_table->entries);
 		for (index=0; index < page_table->entries; index++)
 		{
 			printk(KERN_INFO NVME_STROM_PREFIX
 				   "  V:%p <--> P:%p\n",
-				   (void *)(map_address + index * page_table->page_size),
+				   (void *)(map_address + index * mgmem->page_size),
 				   (void *)(page_table->pages[index]->physical_address));
 		}
 	}
@@ -388,7 +408,7 @@ strom_ioctl_info_gpu_memory(StromCmd__InfoGpuMemory __user *uarg)
 
 	page_table = mgmem->page_table;
 	karg.version = page_table->version;
-	karg.page_size = page_table->page_size;
+	karg.page_size = mgmem->page_size;
 	karg.entries = page_table->entries;
 	if (copy_to_user((void __user *)uarg, &karg, length))
 		rc = -EFAULT;
@@ -403,7 +423,6 @@ strom_ioctl_info_gpu_memory(StromCmd__InfoGpuMemory __user *uarg)
 			break;
 		}
 	}
-
 	strom_put_mapped_gpu_memory(mgmem);
 
 	return rc;
@@ -621,10 +640,6 @@ strom_ioctl_check_file(StromCmd__CheckFile __user *uarg)
  *
  *
  *
- *
- *
- *
- *
  * ================================================================
  */
 struct strom_dma_task
@@ -695,9 +710,13 @@ static int
 __strom_memcpy_ssd2gpu_async(strom_dma_task *dtask)
 {
 #if 0
+	mapped_gpu_memory *mgmem = dtask->mgmem;
 	struct file	   *filp = dtask->filp;
 	struct page	   *page;
+	size_t			dst_offset;
 	int				i, j;
+
+
 
 	for (i=0; i < dtask->nchunks; i++)
 	{
@@ -706,23 +725,26 @@ __strom_memcpy_ssd2gpu_async(strom_dma_task *dtask)
 		if (dchunk->source == 'm')
 		{
 			/* CPU RAM --> GPU RAM DMA */
-			/* We can kick DMA at once */
+			/* It may be multi-pages copy */
 		}
 		else if (dchunk->source == 'f')
 		{
+			loff_t		pos;
+			loff_t		end;
+
 			if (!filp)
 				/* no file handler */;
 
-			pos = dchunk->file_pos & ~PAGE_MASK;
-			ofs = dchunk->file_pos &  PAGE_MASK;
-			end = dchunk->file_pos + length;
+			pos = dchunk->file_pos;
+			end = dchunk->file_pos + dchunk->length;
+
 			while (pos < end)
 			{
-				page = find_get_page(filp->f_mapping, pos);
+				page = find_get_page(filp->f_mapping, pos >> PAGE_SHIFT);
 				if (page)
 				{
 					/* Page Cache --> GPU RAM DMA */
-					
+					/* Single Page Copy */
 				}
 				else
 				{
@@ -1020,104 +1042,140 @@ strom_ioctl_debug(StromCmd__Debug __user *uarg)
  *
  * ================================================================
  */
-static void *
-strom_proc_seq_start(struct seq_file *m, loff_t *pos)
+typedef struct
 {
-	mapped_gpu_memory  *mgmem;
-	struct mutex	   *mutex;
-	struct list_head   *slot;
-	int					index;
+	size_t		length;
+	size_t		usage;
+	char		data[1];
+} strom_proc_entry;
 
-	if (*pos == 0)
-		seq_puts(m, "NVMe-Strom mapped GPU device memory regions");
+static strom_proc_entry *
+strom_proc_printf(strom_proc_entry *spent, const char *fmt, ...)
+{
+	va_list	args;
+	int		count;
+	char	linebuf[200];
 
-	/* pick up first mapping, if any */
-	for (index=0; index < MAPPED_GPU_MEMORY_NSLOTS; index++)
+	if (!spent)
+		return NULL;
+
+	va_start(args, fmt);
+	count = vsnprintf(linebuf, sizeof(linebuf), fmt, args);
+	va_end(args);
+
+	while (spent->usage + count > spent->length)
 	{
-		mutex = &strom_mgmem_mutex[index];
-		slot  = &strom_mgmem_slots[index];
+		strom_proc_entry *spent_new;
+		size_t		length_new = 2 * spent->length;		
 
-		mutex_lock(mutex);
-		list_for_each_entry(mgmem, slot, chain)
-		{
-			return mgmem;	/* keep mutex hold */
-		}
-		mutex_unlock(mutex);
+		spent_new = __krealloc(spent, length_new, GFP_KERNEL);
+		kfree(spent);
+		spent = spent_new;
+		if (!spent)
+			return NULL;
+		spent->length = length_new;
 	}
-	return NULL;
+	strcpy(spent->data + spent->usage, linebuf);
+	spent->usage += count;
+
+	return spent;
 }
-
-static void *
-strom_proc_seq_next(struct seq_file *m, void *p, loff_t *pos)
-{
-	mapped_gpu_memory  *mgmem = (mapped_gpu_memory *) p;
-	int					index = strom_mapped_gpu_memory_index(mgmem->handle);
-	struct mutex	   *mutex = &strom_mgmem_mutex[index];
-	struct list_head   *slot = &strom_mgmem_slots[index];
-
-	/* pick up next entry on the same slot (still under the mutex) */
-	list_for_each_entry_continue(mgmem, slot, chain)
-		return mgmem;
-	mutex_unlock(mutex);
-
-	while (++index < MAPPED_GPU_MEMORY_NSLOTS)
-	{
-		mutex = &strom_mgmem_mutex[index];
-		slot = &strom_mgmem_slots[index];
-
-		mutex_lock(mutex);
-		list_for_each_entry(mgmem, slot, chain);
-			return mgmem;
-		mutex_unlock(mutex);
-	}
-	/* No mapped GPU memory any more */
-	return NULL;
-}
-
-static void
-strom_proc_seq_stop(struct seq_file *m, void *p)
-{
-	BUG_ON(p != NULL);
-}
-
-static int
-strom_proc_seq_show(struct seq_file *m, void *p)
-{
-	mapped_gpu_memory *mgmem = (mapped_gpu_memory *) p;
-	nvidia_p2p_page_table_t *page_table = mgmem->page_table;
-	int			i;
-
-	seq_printf(m,
-			   "GPU Memory Map (handle: %lu, owner: %u, refcnt: %d)\n"
-			   "  Page Table (version=%u, page_size=%u, entries=%u)\n",
-			   mgmem->handle,
-			   mgmem->owner,
-			   mgmem->refcnt,
-			   page_table->version,
-               page_table->page_size,
-               page_table->entries);
-	for (i=0; i < page_table->entries; i++)
-	{
-		seq_printf(m, "    V:%p <--> P:%p\n",
-				   (void *)(mgmem->map_address + page_table->page_size * i),
-				   (void *)(page_table->pages[i]->physical_address));
-	}
-	seq_putc(m, '\n');
-
-	return 0;
-}
-
-static const struct seq_operations strom_proc_seq_ops = {
-	.start		= strom_proc_seq_start,
-	.next		= strom_proc_seq_next,
-	.stop		= strom_proc_seq_stop,
-	.show		= strom_proc_seq_show,
-};
 
 static int
 strom_proc_open(struct inode *inode, struct file *filp)
 {
-	return seq_open(filp, &strom_proc_seq_ops);
+	strom_proc_entry   *spent;
+	mapped_gpu_memory  *mgmem;
+	struct mutex	   *mutex;
+	struct list_head   *slot;
+	nvidia_p2p_page_table_t *page_table;
+	int					i, j;
+
+	spent = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!spent)
+		return -ENOMEM;
+	spent->length = PAGE_SIZE - offsetof(strom_proc_entry, data);
+	spent->usage  = 0;
+
+	/* headline */
+	spent = strom_proc_printf(spent, "# NVM-Strom Mapped GPU Memory\n");
+
+	/* for each mapping */
+	for (i=0; i < MAPPED_GPU_MEMORY_NSLOTS; i++)
+	{
+		mutex = &strom_mgmem_mutex[i];
+		slot  = &strom_mgmem_slots[i];
+
+		mutex_lock(mutex);
+		list_for_each_entry(mgmem, slot, chain)
+		{
+			page_table = mgmem->page_table;
+
+			spent = strom_proc_printf(
+				spent,
+				"handle: %p\n"
+				"owner: %u\n"
+				"refcnt: %d\n"
+				"version: %u\n"
+				"page_size: %zu\n"
+				"entries: %u\n",
+				(void *)mgmem->handle,
+				mgmem->owner,
+				mgmem->refcnt,
+				page_table->version,
+				mgmem->page_size,
+				page_table->entries);
+
+			for (j=0; j < page_table->entries; j++)
+			{
+				spent = strom_proc_printf(
+					spent,
+					"PTE: V:%p <--> P:%p\n",
+					(void *)(mgmem->map_address + mgmem->page_size * j),
+					(void *)(page_table->pages[j]->physical_address));
+			}
+			spent = strom_proc_printf(spent, "\n");
+		}
+		mutex_unlock(mutex);
+	}
+
+	if (!spent)
+		return -ENOMEM;
+	filp->private_data = spent;
+
+	return 0;
+}
+
+static ssize_t
+strom_proc_read(struct file *filp, char __user *buf, size_t len, loff_t *pos)
+{
+	strom_proc_entry   *spent = filp->private_data;
+
+	if (!spent)
+		return -EINVAL;
+
+	printk(KERN_ERR "spent usage=%zu length=%zu\n", spent->usage, spent->length);
+
+	if (*pos >= spent->usage)
+		return 0;
+	if (*pos + len >= spent->usage)
+		len = spent->usage - *pos;
+
+	if (copy_to_user(buf, spent->data + *pos, len))
+		return -EFAULT;
+
+	*pos += len;
+
+	return len;
+}
+
+static int
+strom_proc_release(struct inode *inode, struct file *filp)
+{
+	strom_proc_entry   *spent = filp->private_data;
+	if (spent)
+		kfree(spent);
+	return 0;
 }
 
 static long
@@ -1172,9 +1230,8 @@ strom_proc_ioctl(struct file *filp,
 static const struct file_operations nvme_strom_fops = {
 	.owner			= THIS_MODULE,
 	.open			= strom_proc_open,
-	.read			= seq_read,
-	.llseek			= seq_lseek,
-	.release		= seq_release,
+	.read			= strom_proc_read,
+	.release		= strom_proc_release,
 	.unlocked_ioctl	= strom_proc_ioctl,
 	.compat_ioctl	= strom_proc_ioctl,
 };

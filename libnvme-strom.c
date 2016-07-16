@@ -15,6 +15,7 @@
 #include <libgen.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -52,6 +53,59 @@ nvme_strom_ioctl(int cmd, const void *arg)
 
 
 #ifdef BUILD_AS_DRIVERTEST
+#include <cuda.h>
+
+static void cuda_exit_on_error(CUresult rc, const char *apiname)
+{
+	if (rc != CUDA_SUCCESS)
+	{
+		const char *error_name;
+
+		if (cuGetErrorName(rc, &error_name) != CUDA_SUCCESS)
+			error_name = "unknown error";
+
+		fprintf(stderr, "failed on %s: %s\n", apiname, error_name);
+		exit(1);
+	}
+}
+
+static int drivertest_map_gpumem(size_t required)
+{
+	StromCmd__MapGpuMemory uarg;
+	CUdevice	cuda_device;
+	CUcontext	cuda_context;
+	CUdeviceptr	cuda_devptr;
+	CUresult	rc;
+	int			retval;
+
+	rc = cuInit(0);
+	cuda_exit_on_error(rc, "cuInit");
+
+	rc = cuDeviceGet(&cuda_device, 0);
+	cuda_exit_on_error(rc, "cuDeviceGet");
+
+	rc = cuCtxCreate(&cuda_context, CU_CTX_SCHED_AUTO, cuda_device);
+	cuda_exit_on_error(rc, "cuCtxCreate");
+
+	rc = cuMemAlloc(&cuda_devptr, required);
+	cuda_exit_on_error(rc, "cuMemAlloc");
+
+	memset(&uarg, 0, sizeof(StromCmd__MapGpuMemory));
+	uarg.vaddress = cuda_devptr;
+	uarg.length = required;
+
+	retval = nvme_strom_ioctl(STROM_IOCTL__MAP_GPU_MEMORY, &uarg);
+	printf("STROM_IOCTL__MAP_GPU_MEMORY(%p, %lu) --> %d: %m\n",
+		   (void *)cuda_devptr, required, retval);
+	if (retval != 0)
+		exit(1);
+
+	printf("map handle = %lu\n", uarg.handle);
+
+	system("cat /proc/nvme-strom");
+
+	return 0;
+}
 
 static int drivertest_check_file(const char *filename, int fdesc)
 {
@@ -96,14 +150,19 @@ static int usage(char *argv0)
  */
 int main(int argc, char * const argv[])
 {
-	int			c, fdesc;
+	int			c;
 	int			do_check_supported = 0;
-	const char *filename;
+	long		required = -1;
+	const char *filename = NULL;
+	int			fdesc = -1;
 
-	while ((c = getopt(argc, argv, "ch")) >= 0)
+	while ((c = getopt(argc, argv, "m:ch")) >= 0)
 	{
 		switch (c)
 		{
+			case 'm':
+				required = atol(optarg);
+				break;
 			case 'c':
 				do_check_supported = 1;
 				break;
@@ -113,25 +172,29 @@ int main(int argc, char * const argv[])
 		}
 	}
 
-	if (optind + 1 != argc || !argv[optind])
-		return usage(argv[0]);
-	filename = argv[optind];
-
-
-	fdesc = open(filename, O_RDONLY);
-	if (fdesc < 0)
+	if (optind != argc)
 	{
-		fprintf(stderr, "failed to open \"%s\" : %m\n", argv[optind]);
-		return 1;
+		if (optind + 1 != argc)
+			return usage(argv[0]);
+		filename = argv[optind];
+		fdesc = open(filename, O_RDONLY);
+		if (fdesc < 0)
+		{
+			fprintf(stderr, "failed to open \"%s\": %m\n", argv[optind]);
+			return 1;
+		}
 	}
 
-	if (do_check_supported)
-		drivertest_check_file(filename, fdesc);
-	else
-		drivertest_debug(filename, fdesc);
-	
-	close(fdesc);
-	
+	if (required > 0)
+		drivertest_map_gpumem(required);
+	if (fdesc >= 0)
+	{
+		if (do_check_supported)
+			drivertest_check_file(filename, fdesc);
+		else
+			drivertest_debug(filename, fdesc);
+		close(fdesc);
+	}
 	return 0;
 }
 
