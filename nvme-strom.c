@@ -8,7 +8,9 @@
  *
  */
 #include <asm/uaccess.h>
+#include <linux/async_tx.h>
 #include <linux/buffer_head.h>
+#include <linux/dmaengine.h>
 #include <linux/crc32c.h>
 #include <linux/file.h>
 #include <linux/fs.h>
@@ -352,7 +354,7 @@ strom_ioctl_map_gpu_memory(StromCmd__MapGpuMemory __user *uarg)
 	/* attach this mapped_gpu_memory */
 	index = strom_mapped_gpu_memory_index(mgmem->handle);
 	mutex_lock(&strom_mgmem_mutex[index]);
-	list_add(&strom_mgmem_slots[index], &mgmem->chain);
+	list_add(&mgmem->chain, &strom_mgmem_slots[index]);
 	mutex_unlock(&strom_mgmem_mutex[index]);
 
 	return 0;
@@ -642,6 +644,15 @@ strom_ioctl_check_file(StromCmd__CheckFile __user *uarg)
  *
  * ================================================================
  */
+struct strom_dma_pages
+{
+	struct list_head	chain;
+	unsigned int		nitems;
+	unsigned int		nrooms;
+	struct page		   *pages[1];
+};
+typedef struct strom_dma_pages	strom_dma_pages;
+
 struct strom_dma_task
 {
 	struct list_head	chain;
@@ -649,14 +660,39 @@ struct strom_dma_task
 	mapped_gpu_memory  *mgmem;		/* destination GPU memory segment */
 	struct file		   *filp;		/* source file, if any */
 	struct task_struct *wait_task;	/* task which wait for completion */
+	struct list_head	dma_pages_list;
+	/* chunk definitions */
 	unsigned int		nchunks;
 	strom_dma_chunk		chunks[1];
 };
 typedef struct strom_dma_task	strom_dma_task;
 
+struct strom_dma_state
+{
+	size_t				gpu_page_sz;
+	unsigned int		gpu_entries;
+	nvidia_p2p_page_t  *gpu_pages;
+
+	/* current logical position from the head */
+	size_t			curr_offset;
+	/* current source memory region */
+	dma_addr_t		curr_src_addr;
+	size_t			curr_src_size;
+	/* current source ssd block */
+	sector_t		curr_src_block;
+	size_t			curr_num_blocks;
+	/* current destination range */
+	uint64_t 		curr_dst_addr;
+	size_t			curr_dst_size;
+};
+typedef struct strom_dma_state	strom_dma_state;
+
 #define STROM_DMA_TASK_NSLOTS	100
 static struct mutex		strom_dma_task_mutex[STROM_DMA_TASK_NSLOTS];
 static struct list_head	strom_dma_task_slots[STROM_DMA_TASK_NSLOTS];
+
+#define Max(a,b)		((a) > (b) ? (a) : (b))
+#define Min(a,b)		((a) < (b) ? (a) : (b))
 
 /*
  * strom_dma_task_index
@@ -703,29 +739,250 @@ strom_cleanup_dma_task(unsigned long dma_task_id)
 		   "P2P DMA Task (dma_task_id=%lu) not found\n", dma_task_id);
 }
 
+
+/*
+ * strom_callback_mem2gpu_copy
+ */
+static void
+strom_callback_mem2gpu_copy(void *private)
+{
+	unsigned long	dma_task_id = (unsigned long) private;
+
+}
+
+/*
+ * strom_expand_dma_pages - expand page array of the strom_dma_task
+ */
+static inline strom_dma_pages *
+strom_expand_dma_pages(strom_dma_task *dtask,
+					   strom_dma_pages *dpage_old,
+					   unsigned int min_nrooms)
+{
+	strom_dma_pages	   *dpage_new;
+	unsigned int		nrooms_new;
+
+	if (!dpage_old)
+		nrooms_new = 2 * dtask->nchunks + 10;
+	else
+		nrooms_new = dpage_old->nrooms;
+	nrooms_new = Max(nrooms_new, min_nrooms);
+
+	dpage_new = kmalloc(offsetof(strom_dma_pages,
+								 pages[nrooms_new]),
+						GFP_KERNEL);
+	if (!dpage_new)
+		return NULL;
+
+	dpage->nitems = 0;
+	dpage->nrooms = nrooms_new;
+	list_add(&dma_pages->chain, &dtask->dma_pages_list);
+
+	return dpage;
+}
+
+/*
+ * submit_memcpy_page2gpu
+ */
+static struct dma_async_tx_descriptor *
+submit_memcpy_page2gpu(struct dma_async_tx_descriptor *tx,
+					   struct page *page, strom_dma_state *dstate)
+{
+	// if not continuous segment, submit first
+
+
+	// if destination goes across the bounds, split this page
+	// then, submit the earlier
+
+
+	// update dstate
+
+
+
+	return tx;
+}
+
+/*
+ * submit_memcpy_nvme2gpu
+ */
+static void
+submit_memcpy_nvme2gpu()
+{
+	// if not continuous segment, submit first
+
+
+}
+
 /*
  * __strom_memcpy_ssd2gpu_async
  */
 static int
 __strom_memcpy_ssd2gpu_async(strom_dma_task *dtask)
 {
-#if 0
-	mapped_gpu_memory *mgmem = dtask->mgmem;
-	struct file	   *filp = dtask->filp;
-	struct page	   *page;
-	size_t			dst_offset;
-	int				i, j;
+	mapped_gpu_memory  *mgmem = dtask->mgmem;
+	nvidia_p2p_page_table_t *page_table = mgmem;
+	struct file		   *filp = dtask->filp;
+	strom_dma_pages	   *dpages = NULL;
+	struct page		   *page;
+	dma_addr_t			curr_dst_addr;
+	size_t				curr_dst_size;
+	strom_dma_state		dstate;
+	
+
+
+	struct async_submit_ctl submit;
+	struct dma_async_tx_descriptor *tx;
+	struct dma_chan	   *channel;
+	struct dma_device  *m2g_device;
+		
+
+
+	int				retval = -EINVAL;
+	int				index;
+
+	list_entry((head)->next, typeof(*pos), member)
+
+	/* init stuff related to MEM-to-GPU transfer */
+	init_async_submit(&submit, 0, NULL,
+					  strom_callback_mem2gpu_copy,
+					  dtask, NULL);
+
+	/* init stuff related to SSD-to-GPU transfer */
 
 
 
-	for (i=0; i < dtask->nchunks; i++)
+	/* init strom_dma_state */
+	dstate->gpu_page_sz = mgmem->page_size;
+	dstate->gpu_entries = mgmem->entries;
+	dstate->gpu_pages   = page_table->pages;
+	dstate->curr_offset = dtask->offset;
+	dstate->curr_src_addr = 0UL;	/* invalid address */
+	dstate->curr_src_size = 0;
+	dstate->curr_src_block = ~0UL;	/* invalid block */
+	dstate->curr_num_blocks = 0;
+	i = dstate->curr_offset / mgmem->page_size;
+	dstate->curr_dst_addr = (page_table->pages[i]->physical_address +
+							 curr_dst_offset % mgmem->page_size);
+	dstate->curr_dst_size = 0;
+
+	/*
+	 * submit asynchronous DMA for each chunk
+	 */
+	for (index=0; index < dtask->nchunks; index++)
 	{
-		strom_dma_chunk *dchunk = &dtask->chunks[i];
+		strom_dma_chunk *dchunk = &dma_task->chunks[index];
 
 		if (dchunk->source == 'm')
 		{
-			/* CPU RAM --> GPU RAM DMA */
-			/* It may be multi-pages copy */
+			unsigned int	nr_pages;
+			int				retval;
+
+			/* Pin user pages */
+			nr_pages = (dchunk->length + PAGE_SIZE - 1) / PAGE_SIZE;
+			if (!dpages ||
+				dpages->nitems + nr_pages > dpages->nrooms)
+			{
+				dpages = strom_expand_dma_pages(dtask, dpage, 2 * nr_pages);
+				if (!dpages)
+					goto error;
+			}
+			retval = get_user_pages_fast((unsigned long)dchunk->u.host_addr,
+										 nr_pages, 0,
+										 dma_pages->pages + dma_pages->nitems);
+			if (retval < 0)
+				goto error;
+			else if (retval < nr_pages)
+			{
+				dma_pages->nitems += retval;
+				retval = -EFAULT;
+				goto error;
+			}
+			BUG_ON(retval > nr_pages);
+
+			/*
+			 * Merge pages and submit Mem-to-Gpu DMA
+			 */
+			offset = ((unsigned long)dchunk->u.host_addr) & PAGE_MASK;
+			remain = dchunk->length;
+			for (i=0; i < nr_pages; i++)
+			{
+				page = dma_pages->pages[dma_pages->nitems++];
+				tx = submit_memcpy_mem2gpu(tx, &dstate, page, offset, remain ...);
+
+				if (offset + length >= PAGE_SIZE)
+					pagesz = PAGE_SIZE - offset;
+				else
+					pagesz = length - offset;
+
+				src_addr = dma_map_page(dev, page, offset, pagesz, DMA_TO_DEVICE);
+				/* Is it continuous from the last chunks? */
+				if (curr_dma_addr + curr_dma_len != src_addr)
+				{
+					/*
+					 * If this chunk cannot be merged with the last ones,
+					 * we have to submit the last one first, and then this
+					 * chunk shall be the lead page of the following chunks.
+					 */
+					tx = submit_mem2gpu(curr_dma_addr,
+										curr_dma_len,
+										curr_dst_addr,
+										curr_dst_size);
+					/* revert them to make this chunk first */
+					curr_dma_addr = src_addr;
+					curr_dma_len = 0;
+					curr_dst_addr += curr_dst_size;
+					curr_dst_size = 0;
+				}
+
+				j = (curr_dst_offst + pagesz) / mgmem->page_size;
+				tmp_dst_addr = (page_table->pages[j]->physical_address +
+								(curr_dst_offst + pagesz) % mgmem->page_size);
+				/* Does it go across bound of the destination page? */
+				if (curr_dst_addr + curr_dst_size + pagesz != tmp_dst_addr)
+				{
+					/*
+					 * If destination range will traverse the uncontinuous
+					 * page boundary in GPU side, we have to split this
+					 * DMA segment into two portions, and then submit the
+					 * earlier segment immediately.
+					 */
+					dma_addr_t	tail_dst_addr;
+					size_t		earlier_size;
+
+					tail_dst_addr = ((curr_dst_addr + curr_dst_size + pagesz)
+									 & ~(mgmem->page_size - 1));
+					BUG_ON(tail_dst_addr > curr_dst_addr);
+					earlier_size = tail_dst_addr - curr_dst_addr;
+
+					tx = submit_mem2gpu(curr_dma_addr,
+										cudd_dma_len + temp_size,
+										curr_dst_addr,
+										curr_dst_size + this_size);
+
+					curr_dma_addr += curr_dma_len + temp_size;
+					curr_dma_len;
+					
+										
+					pagesz -= ;
+
+					curr_dst_addr + curr_dst_size + pagesz
+
+
+
+					/* needs to split DMA segment */
+					/* submit the last DMA */
+					/* adjust offset and pagesz */
+				}
+				curr_dst_addr = tmp_dst_addr;
+				curr_dst_size += pagesz;
+				curr_dst_offset += pagesz;
+
+				
+
+
+
+				//tx = async_memcpy(...., tx, &submit);
+				offset = 0;
+			}
 		}
 		else if (dchunk->source == 'f')
 		{
@@ -740,16 +997,29 @@ __strom_memcpy_ssd2gpu_async(strom_dma_task *dtask)
 
 			while (pos < end)
 			{
-				page = find_get_page(filp->f_mapping, pos >> PAGE_SHIFT);
-				if (page)
+				fpage = find_get_page(filp->f_mapping, pos >> PAGE_SHIFT);
+				if (fpage)
 				{
+					if (!dpages || dpages->nitems == dpages->nrooms)
+					{
+						dpages = strom_expand_dma_pages(dtask, dpage, 20);
+						if (!dpages)
+						{
+							put_page(fpage);
+							goto error;
+						}
+					}
+					dpages->pages[dpages->nitems++] = fpage;
+
+					tx = async_memcpy(...., tx, &submit);
+
 					/* Page Cache --> GPU RAM DMA */
 					/* Single Page Copy */
 				}
 				else
 				{
 					/* NVMe SSD --> GPU RAM DMA */
-					
+					/* not implemented yet */
 				}
 			}
 		}
@@ -757,7 +1027,6 @@ __strom_memcpy_ssd2gpu_async(strom_dma_task *dtask)
 			/* invalid source */;
 	}
 
-#endif
 	strom_cleanup_dma_task(dtask->dma_task_id);
 
 	return -EINVAL;
@@ -827,10 +1096,12 @@ strom_memcpy_ssd2gpu_async(StromCmd__MemCpySsdToGpu __user *uarg)
 		goto error_3;
 	}
 
+
+
 	/* registration of the strom_dma_task */
 	index = strom_dma_task_index(dtask->dma_task_id);
 	mutex_lock(&strom_dma_task_mutex[index]);
-	list_add(&strom_dma_task_slots[index], &dtask->chain);
+	list_add(&dtask->chain, &strom_dma_task_slots[index]);
 	mutex_unlock(&strom_dma_task_mutex[index]);
 
 	/*
@@ -847,6 +1118,15 @@ strom_memcpy_ssd2gpu_async(StromCmd__MemCpySsdToGpu __user *uarg)
 
 	return dma_task_id;
 
+error_4:
+	if (dtask->sg_mem2gpu_src)
+		kfree(dtask->sg_mem2gpu_src);
+	if (dtask->sg_mem2gpu_dst)
+		kfree(dtask->sg_mem2gpu_dst);
+	if (dtask->sg_ssd2gpu_src)
+		kfree(dtask->sg_ssd2gpu_src);
+	if (dtask->sg_ssd2gpu_dst)
+		kfree(dtask->sg_ssd2gpu_dst);
 error_3:
 	kfree(dtask);
 error_2:
