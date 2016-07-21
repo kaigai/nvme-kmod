@@ -676,11 +676,11 @@ struct strom_dma_state
 	unsigned int		gpu_entries;
 	nvidia_p2p_page_t  *gpu_pages;
 	/* current logical position from the head of the mapped GPU memory */
-	size_t				curr_offset;
+	size_t				curr_dst_offset;
 	uint64_t			curr_dst_addr;
 	/* current source memory region */
 	dma_addr_t			curr_src_addr;
-	size_t				curr_src_size;
+	size_t				curr_dma_size;
 	/* current source device blocks blocks */
 	sector_t			curr_src_block;
 	size_t				curr_num_blocks;
@@ -783,6 +783,20 @@ __memcpy_page2gpu_fallback()
 }
 
 /*
+ * dma_dest_addr
+ */
+static inline dma_addr_t
+dma_dest_addr(strom_dma_state *dstate, size_t dest_offset)
+{
+	unsigned int	i = dma_dst_offset / dstate->gpu_page_sz;
+
+	Assert(i < dstate->gpu_entries);
+
+	return (dstate->gpu_pages[i]->physical_address +
+			dma_dst_offset % dstate->gpu_page_sz);
+}
+
+/*
  * submit_memcpy_page2gpu
  */
 static struct dma_async_tx_descriptor *
@@ -797,8 +811,12 @@ submit_memcpy_page2gpu(strom_dma_state *dstate,
 	 * to lookup information not to be used. So, we adopt simplified
 	 * interface here.
 	 */
-	struct dma_chan		*chan = __async_tx_find_channel(submit, DMA_MEMCPY);
-	struct dma_device	*device = chan ? chan->device : NULL;
+	struct dma_chan	   *chan = __async_tx_find_channel(submit, DMA_MEMCPY);
+	struct dma_device  *device = chan ? chan->device : NULL;
+	size_t				eh_length;
+	size_t				dma_tail_offset;
+	dma_addr_t			dma_tail_addr;
+	unsigned long		dma_prep_flags = 0;
 
 	if (!device)
 		goto fallback_by_sync_memcpy;
@@ -806,111 +824,125 @@ submit_memcpy_page2gpu(strom_dma_state *dstate,
 	dma_src_addr = dma_map_page(device->dev, page, offset, length,
 								DMA_TO_DEVICE);
 	/*
-	 * Can this source page merge to the pending DMA request?
-	 * If not so, we have to submit the pending one first.
+	 * Is it possible to merge this DMA with the latest pending request?
 	 */
-	if (dstate->curr_src_addr + curr_src_size != dma_src_addr ||
-		length == 0)
+	if (dstate->curr_src_addr + dstate->curr_dma_size == dma_src_addr)
 	{
-		if (dstate->curr_src_addr != 0UL)
+		dma_tail_offset = dstate->curr_dst_offset + length;
+		dma_tail_addr = dma_dest_addr(dstate, dma_tail_offset - 1);
+
+		if (dstate->curr_src_addr +
+			dstate->curr_dma_size + length - 1 == dma_tail_addr)
 		{
-			// flush pending dma if any
-			if (is_dma_copy_aligned(device,
-									dstate->curr_src_addr,
-									dstate->curr_dst_addr,
-									dstate->curr_src_size))
-			{
-				tx = device->device_prep_dma_memcpy(chan,
-													dstate->curr_dst_addr,
-													dstate->curr_src_addr,
-													dstate->curr_src_size,
-													dma_prep_flags);
-			}
-
-			/* fallback by the synchronous copy */
-			if (!tx)
-			{
-				// page number of curr_src_addr
-				// kmap curr_dst_addr
-				// memcpy
-				// repease for each blocks
-
-			}
+			/* OK, this request is entirely merged */
+			dstate->curr_dst_offset += length;
+			dstate->curr_dma_size += length;
+			return;
 		}
 
 		/*
-		 * This page becomes head of the new pending DMA request; the new
-		 * request begins from @dma_src_addr, with uncertain length right
-		 * now. 
-		 * The destination address shall be incremented by length of the
-		 * last pending request. It never comes across GPU page boundary
-		 * because of the checks below.
+		 * Only earlier half can be merged but later half comes across
+		 * page boundary of the destination address. So, we split this
+		 * page into two portions, and then the pending request shall be
+		 * submitted immediately, the later half shall become head of
+		 * the pending request.
 		 */
-		dstate->curr_dst_addr += dstate->curr_src_size;
-		dstate->curr_src_addr = dma_src_addr;
-		dstate->curr_src_size = 0;
-		dstate->curr_src_page = dtask->page_nitems;
+		dma_tail_offset &= ~(dstate->gpu_page_sz - 1);
+		eh_length = dma_tail_offset - dstate->curr_dst_offset;
+		Assert(eh_length < length);
+
+		/* earlier half is merged with the pending request */
+		dstate->curr_dst_offset += eh_length;
+		dstate->curr_dma_size += eh_length;
+		/* the later half shall be head of the pending DMA */
+		offset += eh_length;
+		length -= eh_length;
+		dma_src_addr += eh_length;
 	}
 
 	/*
-	 * In case when destination address traverses GPU page boundary, we have
-	 * to split this page into two portions. The earlier half is merged with
-	 * the current pending request and submit immediately, and then the later
-	 * half becomes the head of the pending request.
-	 * We try to check the destination location of the last byte in the page.
-	 * If it is equivalent to the location calculated by linear manner, it
-	 * does not come across the boundary.
+	 * Submit the pending request, if any
 	 */
-	i = (dstate->curr_offset + length - 1) / dstate->gpu_page_sz;
-	dma_dest_addr = (dstate->gpu_pages[i]->physical_address +
-					 (dstate->curr_offset + length - 1) % dstate->gpu_page_sz);
-	if (dstate->curr_dst_addr +
-		dstate->curr_src_size + length - 1 != dma_dest_addr)
+	if (dstate->curr_src_addr != 0UL)
 	{
-		/*
-		 * Hmm, it looks this request tries to come across the boundary.
-		 */
-		dma_addr_t	dma_tail_addr;
-		size_t		earlier_len;
-
-		dma_tail_addr = (dstate->curr_dst_addr +
-						 dstate->curr_src_size +
-						 length) & ~(dstate->gpu_page_sz - 1);
-		earlier_len = dma_tail_addr - dstate->curr_dst_addr;
-
 		if (is_dma_copy_aligned(device,
 								dstate->curr_src_addr,
 								dstate->curr_dst_addr,
-								earlier_len))
+								dstate->curr_dma_size))
 		{
 			tx = device->device_prep_dma_memcpy(chan,
 												dstate->curr_dst_addr,
 												dstate->curr_src_addr,
-												earlier_len,
+												dstate->curr_dma_size,
 												dma_prep_flags);
 		}
-
 		/* fallback by the synchronous copy */
 		if (!tx)
 		{
-			fallback and wait
-
+			// page number of curr_src_addr
+			// kmap curr_dst_addr
+			// memcpy
+			// repease for each blocks
+			BUG();	/* not implemented yet */
 		}
+	}
 
-		/*
-		 * The later half becomes head of the pending request.
-		 */
-		dstate->curr_dst_addr =  dma_dst_addr & ~(dstate->gpu_page_sz - 1);
-		dstate->curr_src_addr =  dma_src_addr + earlier_len;
-		dstate->curr_src_size += length - earlier_len;
-		dstate->curr_src_page =  dtask->page_nitems;
-		dstate->curr_offset   += length;
-	}
-	else
+	/*
+	 * This page is the next head of the pending DMA
+	 */
+	dstate->curr_src_addr = dma_src_addr;
+	dstate->curr_dma_size = 0;
+
+	i = dstate->curr_dst_offset / dstate->gpu_page_sz;
+	dstate->dma_dst_addr = (dstate->gpu_pages[i]->physical_address +
+							dstate->curr_dst_offset % dstate->gpu_page_sz);
+
+	dma_tail_offset = dstate->curr_dst_offset + length;
+	dma_tail_addr = dma_dest_addr(dstate, dma_tail_offset - 1);
+
+	/*
+	 * If this page comes across boundary of the destination GPU pages,
+	 * we have to submit the earlier half only.
+	 */
+	if (dstate->dma_dst_addr + length - 1 != dma_tail_addr)
 	{
-		dstate->curr_src_size += length;
-		dstate->curr_offset   += length;
+		dma_tail_offset &= ~(dstate->gpu_page_sz - 1);
+		eh_length = dma_tail_offset - dstate->curr_dst_offset;
+		Assert(eh_length < length);
+
+		if (is_dma_copy_aligned(device,
+								dstate->curr_src_addr,
+								dstate->curr_dst_addr,
+								eh_length))
+		{
+			tx = device->device_prep_dma_memcpy(chan,
+                                                dstate->curr_dst_addr,
+                                                dstate->curr_src_addr,
+												eh_length,
+												dma_prep_flags);
+		}
+		/* fallback by the synchronous copy */
+		if (!tx)
+		{
+			// page number of curr_src_addr
+			// kmap curr_dst_addr
+			// memcpy
+			// repease for each blocks
+			BUG();  /* not implemented yet */
+		}
+		dstate->curr_dst_offset += eh_length;
+
+
+		offset += eh_length;
+		length -= eh_length;
 	}
+
+
+
+
+
+
+
 }
 
 /*
@@ -984,12 +1016,16 @@ __strom_memcpy_ssd2gpu_async(strom_dma_task *dtask)
 
 		if (dchunk->source == 'm')
 		{
+			size_t			offset;
+			size_t			length;
 			unsigned int	nr_pages;
-			unsigned int	page_len;
+			unsigned int	dma_len;
+			unsigned int	dma_pages_base;
 			int				retval;
 
 			/* pin user pages */
-			nr_pages = (dchunk->length + PAGE_SIZE - 1) / PAGE_SIZE;
+			nr_pages = (((unsigned long)dchunk->u.host_addr & (PAGE_SIZE-1)) +
+						dchunk->length + (PAGE_SIZE-1)) / PAGE_SIZE;
 			if (!dtask->dma_pages ||
 				dtask->dma_pages_nitems + nr_pages > dtask->dma_pages_nrooms)
 			{
@@ -1015,19 +1051,22 @@ __strom_memcpy_ssd2gpu_async(strom_dma_task *dtask)
 			/*
 			 * Merge pages and submit Mem-to-Gpu DMA
 			 */
-			offset = ((unsigned long)dchunk->u.host_addr) & PAGE_MASK;
+			offset = (unsigned long)dchunk->u.host_addr & (PAGE_SIZE-1);
 			length = dchunk->length;
+			dma_pages_base = dtask->dma_pages_nitems;
+			dtask->dma_pages_nitems += nr_pages;
 			for (i=0; i < nr_pages; i++)
 			{
-				page = dma_pages->pages[dma_pages->nitems++];
+				page = dtask->dma_pages[dma_pages_base + i];
 				if (offset + length >= PAGE_SIZE)
-					pagelen = PAGE_SIZE - offset;
+					dma_len = PAGE_SIZE - offset;
 				else
-					pagelen = length - offset;
+					dma_len = length - offset;
 
-				tx = submit_memcpy_page2gpu(page, offset, pagelen);
-				if (!tx)
-					error;
+				submit_memcpy_page2gpu(page, offset, dma_len);
+				// do error check
+
+				length -= dma_len;
 				offset = 0;
 			}
 		}
@@ -1047,6 +1086,10 @@ __strom_memcpy_ssd2gpu_async(strom_dma_task *dtask)
 				fpage = find_get_page(filp->f_mapping, pos >> PAGE_SHIFT);
 				if (fpage)
 				{
+					/*
+					 * Page cache found in this block, so we choose
+					 * RAM-to-GPU DMA.
+					 */
 					if (!dtask->dma_pages ||
 						dtask->dma_pages_nitems == dtask->dma_pages_nrooms)
 					{
@@ -1057,12 +1100,18 @@ __strom_memcpy_ssd2gpu_async(strom_dma_task *dtask)
 							goto error;
 						}
 					}
-					dpages->pages[dpages->nitems++] = fpage;
+					dtask->dma_pages[dtask->dma_pages_nitems++] = fpage;
 
-					tx = submit_memcpy_page2gpu(page, offset, pagelen);
-					if (!tx)
-						error;
 
+					offset = pos & (PAGE_SIZE-1);
+					if (end - pos < PAGE_SIZE)
+						dma_len = end - pos;
+					else
+						dma_len = PAGE_SIZE - offset;
+
+					tx = submit_memcpy_page2gpu(page, offset, dma_len);
+					// error check
+					pos += dma_len;
 
 					/* Page Cache --> GPU RAM DMA */
 					/* Single Page Copy */
