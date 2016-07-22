@@ -154,9 +154,7 @@ __strom_lookup_extra_symbol(const char *symbol_name,
 	addr = kallsyms_lookup_name(symbol_name);
 	if (!addr)
 	{
-		printk(KERN_ERR NVME_STROM_PREFIX
-			   "could not solve the kernel symbol: %s\n",
-			   symbol_name);
+		prError("could not solve the kernel symbol: %s", symbol_name);
 		return -ENOENT;
 	}
 
@@ -164,15 +162,13 @@ __strom_lookup_extra_symbol(const char *symbol_name,
 	if (mod)
 	{
 		__module_get(mod);
-		printk(KERN_NOTICE NVME_STROM_PREFIX
-			   "extra symbol \"%s\" found at %p of module \"%s\"\n",
-			   symbol_name, (void *)addr, mod->name);
+		prNotice("extra symbol \"%s\" found at %p of module \"%s\"",
+				 symbol_name, (void *)addr, mod->name);
 	}
 	else
 	{
-		printk(KERN_NOTICE NVME_STROM_PREFIX
-			   "extra symbol \"%s\" found at %p (core kernel)\n",
-			   symbol_name, (void *)addr);
+		prNotice("extra symbol \"%s\" found at %p (core kernel)\n",
+				 symbol_name, (void *)addr);
 	}
 	*symbol_addr = (void *) addr;
 	*symbol_mod  = mod;

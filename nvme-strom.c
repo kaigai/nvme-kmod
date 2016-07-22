@@ -19,6 +19,7 @@
 #include <linux/kernel.h>
 #include <linux/magic.h>
 #include <linux/major.h>
+#include <linux/moduleparam.h>
 #include <linux/nvme.h>
 #include <linux/notifier.h>
 #include <linux/proc_fs.h>
@@ -28,9 +29,6 @@
 #include <linux/version.h>
 #include "nv-p2p.h"
 #include "nvme-strom.h"
-
-/* prefix of printk */
-#define NVME_STROM_PREFIX "nvme-strom: "
 
 /* check the target kernel to build */
 #if defined(RHEL_MAJOR) && (RHEL_MAJOR == 7)
@@ -50,6 +48,38 @@
 #define lengthof(array)	(sizeof (array) / sizeof ((array)[0]))
 #define Max(a,b)		((a) > (b) ? (a) : (b))
 #define Min(a,b)		((a) < (b) ? (a) : (b))
+
+static int	verbose;
+module_param(verbose, int, 1);
+
+#define prDebug(fmt, ...)												\
+	do {																\
+		if (verbose)													\
+			printk(KERN_INFO "nvme-strom: " fmt ", %s at %s:%d\n",		\
+				   ##__VA_ARGS__, __FUNCTION__, __FILE__, __LINE__);	\
+	} while(0)
+
+#define prInfo(fmt, ...)												\
+	do {																\
+		if (verbose)													\
+			printk(KERN_INFO "nvme-strom: " fmt "\n", ##__VA_ARGS__);	\
+	} while(0)
+
+#define prNotice(fmt, ...)												\
+	do {																\
+		if (verbose)													\
+			printk(KERN_NOTICE "nvme-strom: " fmt "\n", ##__VA_ARGS__);	\
+	} while(0)
+
+#define prWarn(fmt, ...)						\
+	do {																\
+		printk(KERN_WARNING "nvme-strom: " fmt "\n", ##__VA_ARGS__);	\
+	} while(0)
+
+#define prError(fmt, ...)												\
+	do {																\
+		printk(KERN_ERR "nvme-strom: " fmt "\n", ##__VA_ARGS__);		\
+	} while(0)
 
 /* routines for extra symbols */
 #include "extra-ksyms.c"
@@ -160,8 +190,7 @@ strom_get_mapped_gpu_memory(unsigned long handle)
 	}
 	mutex_unlock(mutex);
 
-	printk(KERN_ERR NVME_STROM_PREFIX
-		   "P2P GPU Memory (handle=0x%lx) not found\n", handle);
+	prError("P2P GPU Memory (handle=0x%lx) not found", handle);
 
 	return NULL;	/* not found */
 }
@@ -249,18 +278,15 @@ __strom_clenup_mapped_gpu_memory(unsigned long handle)
 		 */
 		rc = __nvidia_p2p_free_page_table(mgmem->page_table);
 		if (rc)
-			printk(KERN_ERR NVME_STROM_PREFIX
-				   "nvidia_p2p_free_page_table (handle=0x%lx, rc=%d)\n",
-				   handle, rc);
+			prError("nvidia_p2p_free_page_table (handle=0x%lx, rc=%d)",
+					handle, rc);
 		kfree(mgmem);
 
-		printk(KERN_ERR NVME_STROM_PREFIX
-			   "P2P GPU Memory (handle=%p) was released\n", (void *)handle);
+		prInfo("P2P GPU Memory (handle=%p) was released", (void *)handle);
 		return 0;
 	}
 	mutex_unlock(mutex);
-	printk(KERN_ERR NVME_STROM_PREFIX
-		   "P2P GPU Memory (handle=%p) already released\n", (void *)handle);
+	prError("P2P GPU Memory (handle=%p) already released", (void *)handle);
 	return -ENOENT;
 }
 
@@ -313,9 +339,8 @@ strom_ioctl_map_gpu_memory(StromCmd__MapGpuMemory __user *uarg)
 								mgmem);		/* as handle */
 	if (rc)
 	{
-		printk(KERN_ERR NVME_STROM_PREFIX
-			   "failed on nvidia_p2p_get_pages(addr=%p, length=%zu), rc=%d\n",
-			   (void *)map_address, (size_t)map_offset + karg.length, rc);
+		prError("failed on nvidia_p2p_get_pages(addr=%p, len=%zu), rc=%d",
+				(void *)map_address, (size_t)map_offset + karg.length, rc);
 		goto error_1;
 	}
 
@@ -347,8 +372,7 @@ strom_ioctl_map_gpu_memory(StromCmd__MapGpuMemory __user *uarg)
 	{
 		nvidia_p2p_page_table_t *page_table = mgmem->page_table;
 
-		printk(KERN_INFO NVME_STROM_PREFIX
-			   "P2P GPU Memory (handle=%p) mapped\n"
+		prInfo("P2P GPU Memory (handle=%p) mapped\n"
 			   "  version=%u, page_size=%zu, entries=%u\n",
 			   (void *)mgmem->handle,
 			   page_table->version,
@@ -356,8 +380,7 @@ strom_ioctl_map_gpu_memory(StromCmd__MapGpuMemory __user *uarg)
 			   page_table->entries);
 		for (index=0; index < page_table->entries; index++)
 		{
-			printk(KERN_INFO NVME_STROM_PREFIX
-				   "  V:%p <--> P:%p\n",
+			prInfo("  V:%p <--> P:%p\n",
 				   (void *)(map_address + index * mgmem->page_size),
 				   (void *)(page_table->pages[index]->physical_address));
 		}
@@ -473,9 +496,8 @@ source_file_is_supported(struct file *filp)
 	 */
 	if ((filp->f_mode & FMODE_READ) == 0)
 	{
-		printk(KERN_ERR NVME_STROM_PREFIX
-			   "process (pid=%u) has no permission to read file\n",
-			   current->pid);
+		prError("process (pid=%u) has no permission to read file",
+				current->pid);
 		return -EACCES;
 	}
 
@@ -497,8 +519,7 @@ source_file_is_supported(struct file *filp)
 		   strcmp(s_type->name, "xfs") == 0 &&
 		   s_type->owner == mod_xfs_get_blocks)))
 	{
-		printk(KERN_INFO NVME_STROM_PREFIX
-			   "file_system_type name=%s, not supported", s_type->name);
+		prError("file_system_type name=%s, not supported", s_type->name);
 		return -ENOTSUPP;
 	}
 
@@ -514,8 +535,7 @@ source_file_is_supported(struct file *filp)
 	{
 		unsigned long		i_size = f_inode->i_size;
 		spin_unlock(&f_inode->i_lock);
-		printk(KERN_INFO NVME_STROM_PREFIX
-			   "file size too small (%lu bytes), not suitable\n", i_size);
+		prError("file size too small (%lu bytes), not suitable", i_size);
 		return -ENOTSUPP;
 	}
 	spin_unlock(&f_inode->i_lock);
@@ -528,9 +548,8 @@ source_file_is_supported(struct file *filp)
 	 */
 	if (i_sb->s_blocksize != PAGE_SIZE)
 	{
-		printk(KERN_INFO NVME_STROM_PREFIX
-			   "block size does not match with PAGE_SIZE (%lu)\n",
-			   i_sb->s_blocksize);
+		prError("block size does not match with PAGE_SIZE (%lu)",
+				i_sb->s_blocksize);
 		return -ENOTSUPP;
 	}
 
@@ -544,9 +563,8 @@ source_file_is_supported(struct file *filp)
 	/* 'devext' shall wrap NVMe-SSD device */
 	if (bd_disk->major != BLOCK_EXT_MAJOR)
 	{
-		printk(KERN_INFO NVME_STROM_PREFIX
-			   "block device major number = %d, not 'blkext'\n",
-			   bd_disk->major);
+		prError("block device major number = %d, not 'blkext'",
+				bd_disk->major);
 		return -ENOTSUPP;
 	}
 
@@ -575,26 +593,23 @@ source_file_is_supported(struct file *filp)
 
 	if (dname)
 	{
-		printk(KERN_INFO NVME_STROM_PREFIX
-			   "block device '%s' is not supported", dname);
+		prError("block device '%s' is not supported", dname);
 		return -ENOTSUPP;
 	}
 
 	/* try to call ioctl */
 	if (!bd_disk->fops->ioctl)
 	{
-		printk(KERN_INFO NVME_STROM_PREFIX
-			   "block device '%s' does not provide ioctl\n",
-			   bd_disk->disk_name);
+		prError("block device '%s' does not provide ioctl",
+				bd_disk->disk_name);
 		return -ENOTSUPP;
 	}
 
 	rc = bd_disk->fops->ioctl(s_bdev, 0, NVME_IOCTL_ID, 0UL);
 	if (rc < 0)
 	{
-		printk(KERN_INFO NVME_STROM_PREFIX
-			   "ioctl(NVME_IOCTL_ID) on '%s' returned an error: %d\n",
-			   bd_disk->disk_name, rc);
+		prError("ioctl(NVME_IOCTL_ID) on '%s' returned an error: %d",
+				bd_disk->disk_name, rc);
 		return -ENOTSUPP;
 	}
 	/* OK, we assume the underlying device is supported NVMe-SSD */
@@ -728,8 +743,7 @@ strom_put_dma_task(strom_dma_task *dtask)
 			wake_up_process(dtask->wait_task);
 		kfree(dtask);
 
-		printk(KERN_INFO NVME_STROM_PREFIX
-			   "DMA task (id=%p) was completed\n", dtask);
+		prInfo("DMA task (id=%p) was completed", dtask);
 		return;
 	}
 	spin_unlock_irqrestore(lock, flags);
@@ -911,8 +925,7 @@ static int
 submit_dma_ssd2gpu(strom_dma_task *dtask, size_t dest_offset,
 				   sector_t start_block, size_t offset, size_t length)
 {
-	printk(KERN_INFO NVME_STROM_PREFIX
-		   "SSD2GPU DMA (block=%lu...%lu)\n",
+	prInfo("SSD2GPU DMA (block=%lu...%lu)",
 		   (unsigned long)(start_block + offset / PAGE_SIZE),
 		   (unsigned long)(start_block + (offset + length) / PAGE_SIZE));
 	return 0;
@@ -1144,9 +1157,8 @@ strom_memcpy_ssd2gpu_async(StromCmd__MemCpySsdToGpu __user *uarg,
 		filp = fget(karg.fdesc);
 		if (!filp)
 		{
-			printk(KERN_ERR NVME_STROM_PREFIX
-				   "file descriptor %d of process %u is not available\n",
-				   karg.fdesc, current->tgid);
+			prError("file descriptor %d of process %u is not available",
+					karg.fdesc, current->tgid);
 			return -EBADF;
 		}
 		rc = source_file_is_supported(filp);
@@ -1574,8 +1586,7 @@ int	__init nvme_strom_init(void)
 		proc_remove(nvme_strom_proc);
 		return rc;
 	}
-	printk(KERN_INFO NVME_STROM_PREFIX
-		   "/proc/nvme-strom entry was registered\n");
+	prInfo("/proc/nvme-strom entry was registered");
 	return 0;
 }
 module_init(nvme_strom_init);
@@ -1584,8 +1595,7 @@ void __exit nvme_strom_exit(void)
 {
 	strom_exit_extra_symbols();
 	proc_remove(nvme_strom_proc);
-	printk(KERN_INFO NVME_STROM_PREFIX
-		   "/proc/nvme-strom entry was unregistered\n");
+	prInfo("/proc/nvme-strom entry was unregistered");
 }
 module_exit(nvme_strom_exit);
 
