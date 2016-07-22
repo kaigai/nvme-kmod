@@ -69,7 +69,7 @@ static void cuda_exit_on_error(CUresult rc, const char *apiname)
 	}
 }
 
-static int drivertest_map_gpumem(size_t required)
+static int drivertest_map_gpumem(size_t required, int do_host_dma_test)
 {
 	StromCmd__MapGpuMemory uarg;
 	CUdevice	cuda_device;
@@ -104,6 +104,51 @@ static int drivertest_map_gpumem(size_t required)
 
 	system("cat /proc/nvme-strom");
 
+	/*
+	 * RAM->GPU DMA Test
+	 */
+	if (do_host_dma_test)
+	{
+		StromCmd__MemCpySsdToGpu dma_arg;
+		char	   *src_buffer;
+		void	   *dst_buffer;
+		char	   *pos;
+
+		src_buffer = malloc(required);
+		if (!src_buffer)
+		{
+			fprintf(stderr, "out of memory: %m\n");
+			exit(1);
+		}
+		rc = cuMemAllocHost(&dst_buffer, required);
+		cuda_exit_on_error(rc, "cuMemAllocHost");
+
+		/* fill up by random */
+		srand(time(NULL));
+		for (pos = src_buffer; pos < src_buffer + required; pos++)
+			*pos = (char)rand();
+
+		/* src_buffer -> GPU RAM */
+		dma_arg.handle = uarg.handle;
+		dma_arg.offset = 0;
+		dma_arg.fdesc = -1;
+		dma_arg.nchunks = 1;
+		dma_arg.chunks[0].length = required;
+		dma_arg.chunks[0].source = 'm';
+		dma_arg.chunks[0].u.host_addr = src_buffer;
+
+		retval = nvme_strom_ioctl(STROM_IOCTL__MEMCPY_SSD2GPU, &dma_arg);
+		printf("STROM_IOCTL__MEMCPY_SSD2GPU(%zu bytes) --> %d: %m\n",
+			   required, retval);
+
+		/* GPU RAM -> dst_buffer */
+		rc = cuMemcpyDtoH(dst_buffer, cuda_devptr, required);
+		cuda_exit_on_error(rc, "cuMemcpyDtoH");
+
+		/* compare results */
+		retval = memcmp(src_buffer, dst_buffer, required);
+		printf("memcmp(src, dst, %zu) --> %d\n", required, retval);
+	}
 	return 0;
 }
 
@@ -152,14 +197,18 @@ int main(int argc, char * const argv[])
 {
 	int			c;
 	int			do_check_supported = 0;
+	int			do_host_dma_test = 0;
 	long		required = -1;
 	const char *filename = NULL;
 	int			fdesc = -1;
 
-	while ((c = getopt(argc, argv, "m:ch")) >= 0)
+	while ((c = getopt(argc, argv, "dm:ch")) >= 0)
 	{
 		switch (c)
 		{
+			case 'd':
+				do_host_dma_test = 1;
+				break;
 			case 'm':
 				required = atol(optarg);
 				break;
@@ -186,7 +235,7 @@ int main(int argc, char * const argv[])
 	}
 
 	if (required > 0)
-		drivertest_map_gpumem(required);
+		drivertest_map_gpumem(required, do_host_dma_test);
 	if (fdesc >= 0)
 	{
 		if (do_check_supported)
