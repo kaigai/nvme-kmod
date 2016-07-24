@@ -32,6 +32,8 @@ typedef struct StromCmd__CheckFile		StromCmd__CheckFile;
 struct StromCmd__MapGpuMemory
 {
 	unsigned long	handle;		/* out: handler of the mapped region */
+	uint32_t		gpu_page_sz;/* out: page size of GPU memory */
+	uint32_t		gpu_npages;	/* out: number of page entries */
 	uint64_t		vaddress;	/* in: virtual address of the device memory */
 	size_t			length;		/* in: length of the device memory */
 };
@@ -50,23 +52,25 @@ struct StromCmd__InfoGpuMemory
 	unsigned long	handle;		/* in: handler of the mapped region */
 	uint32_t		nrooms;		/* in: length of the variable length array */
 	uint32_t		version;	/* out: 'version' of the page tables */
-	uint32_t		page_size;	/* out: 'page_size' in bytes */
-	uint32_t		entries;	/* out: num of physical_address[] entries */
-	uint64_t		physical_address[1];
+	uint32_t		gpu_page_sz;/* out: 'page_size' in bytes */
+	uint32_t		nitems;		/* out: number of GPU pages */
+	struct {
+		void	   *vaddr;		/* out: io-mapped virtual address */
+		uint64_t	paddr;		/* out: physical address */
+	} pages[1];
 };
 typedef struct StromCmd__InfoGpuMemory	StromCmd__InfoGpuMemory;
 
 /* STROM_IOCTL__MEMCPY_SSD2GPU and STROM_IOCTL__MEMCPY_SSD2GPU_ASYNC */
 struct strom_dma_chunk
 {
-	unsigned int	length;		/* in: length of this chunk */
-	char			source;		/* in: source of this chunk */
-	union {						/*     'f': file, 'm': host memory */
-		loff_t		file_pos;	/* in: file offset from the head */
-		void	   *host_addr;	/* in: host memory address */
-	} u;
+	loff_t			file_pos;	/* in: file offset from the head */
+	size_t			length;		/* in: length of this chunk */
 };
 typedef struct strom_dma_chunk	strom_dma_chunk;
+
+#define STROM_MEMCPY_SRC_ALIGN		512
+#define STROM_MEMCPY_DST_ALIGN		4
 
 struct StromCmd__MemCpySsdToGpu
 {

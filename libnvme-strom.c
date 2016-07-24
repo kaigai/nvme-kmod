@@ -47,13 +47,10 @@ nvme_strom_ioctl(int cmd, const void *arg)
 
 
 
-
-
-
-
-
 #ifdef BUILD_AS_DRIVERTEST
 #include <cuda.h>
+
+#define offsetof(type, field)   ((long) &((type *)0)->field)
 
 static void cuda_exit_on_error(CUresult rc, const char *apiname)
 {
@@ -69,7 +66,41 @@ static void cuda_exit_on_error(CUresult rc, const char *apiname)
 	}
 }
 
-static int drivertest_map_gpumem(size_t required, int do_host_dma_test)
+static int
+drivertest_debug(void)
+{
+	StromCmd__Debug	uarg;
+	int				retval;
+
+	uarg.fdesc = -1;
+	uarg.offset = 0;
+	uarg.length = 0;
+
+	retval = nvme_strom_ioctl(STROM_IOCTL__DEBUG, &uarg);
+	printf("STROM_IOCTL__DEBUG() --> %d : %m\n", retval);
+
+	return retval;
+}
+
+static void
+drivertest_check_file(const char *filename, int fdesc)
+{
+	StromCmd__CheckFile uarg;
+	int		rc;
+
+	uarg.fdesc = fdesc;
+
+	rc = nvme_strom_ioctl(STROM_IOCTL__CHECK_FILE, &uarg);
+	printf("STROM_IOCTL__CHECK_FILE('%s') --> %d : %m\n", filename, rc);
+	if (rc)
+		exit(rc);
+}
+
+static void
+drivertest_map_gpumem(const char *filename, size_t file_size,
+					  CUdeviceptr *p_devptr,
+					  unsigned long *p_handle,
+					  unsigned int *p_num_pages)
 {
 	StromCmd__MapGpuMemory uarg;
 	CUdevice	cuda_device;
@@ -87,23 +118,67 @@ static int drivertest_map_gpumem(size_t required, int do_host_dma_test)
 	rc = cuCtxCreate(&cuda_context, CU_CTX_SCHED_AUTO, cuda_device);
 	cuda_exit_on_error(rc, "cuCtxCreate");
 
-	rc = cuMemAlloc(&cuda_devptr, required);
+	rc = cuMemAlloc(&cuda_devptr, file_size);
 	cuda_exit_on_error(rc, "cuMemAlloc");
 
 	memset(&uarg, 0, sizeof(StromCmd__MapGpuMemory));
 	uarg.vaddress = cuda_devptr;
-	uarg.length = required;
+	uarg.length = file_size;
 
 	retval = nvme_strom_ioctl(STROM_IOCTL__MAP_GPU_MEMORY, &uarg);
-	printf("STROM_IOCTL__MAP_GPU_MEMORY(%p, %lu) --> %d: %m\n",
-		   (void *)cuda_devptr, required, retval);
-	if (retval != 0)
+	printf("STROM_IOCTL__MAP_GPU_MEMORY(%p, %lu, handle=%lx) --> %d: %m\n",
+		   (void *)cuda_devptr, file_size, uarg.handle, retval);
+	if (retval)
+		exit(retval);
+
+	*p_devptr = cuda_devptr;
+	*p_handle = uarg.handle;
+	*p_num_pages = uarg.gpu_npages;
+
+}
+
+static void
+drivertest_print_gpumem(unsigned long handle, unsigned int num_pages)
+{
+	StromCmd__InfoGpuMemory *uarg;
+	size_t	required;
+	int		i, retval;
+
+	required = offsetof(StromCmd__InfoGpuMemory, pages[num_pages]);
+	uarg = malloc(required);
+	if (!uarg)
+	{
+		fprintf(stderr, "out of memory: %m\n");
 		exit(1);
+	}
+	memset(uarg, 0, required);
+	uarg->handle = handle;
+	uarg->nrooms = num_pages;
 
-	printf("map handle = %lu\n", uarg.handle);
+	retval = nvme_strom_ioctl(STROM_IOCTL__INFO_GPU_MEMORY, uarg);
+	printf("STROM_IOCTL__INFO_GPU_MEMORY(handle=%lx) --> %d: %m\n",
+		   handle, retval);
+	if (retval)
+		exit(retval);
 
-	system("cat /proc/nvme-strom");
+	printf("Handle=%lx version=%u gpu_page_sz=%u\n",
+		   handle, uarg->version, uarg->gpu_page_sz);
+	for (i=0; i < uarg->nitems; i++)
+	{
+		printf("V:%016lx <--> P:%016lx\n",
+			   (void *)uarg->pages[i].vaddr,
+			   (void *)uarg->pages[i].paddr);
+	}
+	free(uarg);
+}
 
+static void
+drivertest_dma_gpumem(const char *filename, int fdesc, size_t file_size,
+					  CUdeviceptr devptr, unsigned long handle)
+{
+
+
+#if 0
 	/*
 	 * RAM->GPU DMA Test
 	 */
@@ -151,43 +226,7 @@ static int drivertest_map_gpumem(size_t required, int do_host_dma_test)
 	}
 	return 0;
 }
-
-static int drivertest_check_file(const char *filename, int fdesc)
-{
-	StromCmd__CheckFile uarg;
-	int		rc;
-
-	uarg.fdesc = fdesc;
-
-	rc = nvme_strom_ioctl(STROM_IOCTL__CHECK_FILE, &uarg);
-	printf("STROM_IOCTL__CHECK_FILE('%s') --> %d : %m\n", filename, rc);
-	return rc;
-}
-
-static void drivertest_debug(const char *filename, int fdesc)
-{
-	StromCmd__Debug	uarg;
-	struct stat		stbuf;
-	int				rc;
-
-	if (fstat(fdesc, &stbuf) != 0)
-	{
-		printf("failed on fstat(2): %m\n");
-		return;
-	}
-	uarg.fdesc = fdesc;
-	uarg.offset = 0;
-	uarg.length = stbuf.st_size;
-
-	rc = nvme_strom_ioctl(STROM_IOCTL__DEBUG, &uarg);
-	printf("STROM_IOCTL__DEBUG('%s') --> %d : %m\n", filename, rc);
-}
-
-static int usage(char *argv0)
-{
-	fprintf(stderr, "usage: %s [options] <filename>\n",
-			basename(argv0));
-	return 1;
+#endif
 }
 
 /*
@@ -195,55 +234,50 @@ static int usage(char *argv0)
  */
 int main(int argc, char * const argv[])
 {
-	int			c;
-	int			do_check_supported = 0;
-	int			do_host_dma_test = 0;
-	long		required = -1;
-	const char *filename = NULL;
-	int			fdesc = -1;
+	const char	   *filename;
+	int				fdesc = -1;
+	struct stat		stbuf;
+	CUdeviceptr		devptr;
+	unsigned long	handle;
+	unsigned int	num_pages;
+	int				rc;
 
-	while ((c = getopt(argc, argv, "dm:ch")) >= 0)
+	if (argc != 2)
 	{
-		switch (c)
-		{
-			case 'd':
-				do_host_dma_test = 1;
-				break;
-			case 'm':
-				required = atol(optarg);
-				break;
-			case 'c':
-				do_check_supported = 1;
-				break;
-			case 'h':
-			default:
-				return usage(argv[0]);
-		}
+		fprintf(stderr, "usage: %s (<filename>|-debug)\n", basename(argv[0]));
+		return 1;
+	}
+	filename = argv[1];
+	if (strcmp(filename, "-debug") == 0)
+		return drivertest_debug();
+
+	fdesc = open(filename, O_RDONLY);
+	if (fdesc < 0)
+	{
+		fprintf(stderr, "failed to open \"%s\": %m\n", filename);
+		return 1;
 	}
 
-	if (optind != argc)
+	if (fstat(fdesc, &stbuf) != 0)
 	{
-		if (optind + 1 != argc)
-			return usage(argv[0]);
-		filename = argv[optind];
-		fdesc = open(filename, O_RDONLY);
-		if (fdesc < 0)
-		{
-			fprintf(stderr, "failed to open \"%s\": %m\n", argv[optind]);
-			return 1;
-		}
+		fprintf(stderr, "failed on fstat(\"%s\"): %m\n", filename);
+		return 1;
 	}
 
-	if (required > 0)
-		drivertest_map_gpumem(required, do_host_dma_test);
-	if (fdesc >= 0)
-	{
-		if (do_check_supported)
-			drivertest_check_file(filename, fdesc);
-		else
-			drivertest_debug(filename, fdesc);
-		close(fdesc);
-	}
+	/* is this file supported? */
+	drivertest_check_file(filename, fdesc);
+
+	/* if supported, try to alloc device memory */
+	drivertest_map_gpumem(filename, stbuf.st_size,
+						  &devptr, &handle, &num_pages);
+
+	/* print device memory map information */
+	drivertest_print_gpumem(handle, num_pages);
+
+	/* kick DMA from file to device memory */
+	drivertest_dma_gpumem(filename, fdesc, stbuf.st_size,
+						  devptr, handle);
+
 	return 0;
 }
 
