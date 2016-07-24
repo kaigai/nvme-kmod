@@ -727,6 +727,8 @@ struct strom_dma_task
 	mapped_gpu_memory  *mgmem;		/* destination GPU memory segment */
 	size_t				dest_offset;/* current destination offset from
 									 * the mgmem head */
+	sector_t			src_block;	/* head of the source blocks */
+	unsigned int		nr_blocks;	/* num of blocks pending for submit */
 	struct file		   *filp;		/* source file, if any */
 	struct task_struct *wait_task;	/* task which wait for completion */
 	/* definition of the chunks */
@@ -906,6 +908,9 @@ submit_ram2gpu_memcpy(strom_dma_task *dtask,
 		kunmap_atomic(src_buffer);
 
 		put_page(fpage);	// it shall be in the callback if async
+
+		/* make advance the destination pointer */
+		dtask->dest_offset += unitsz;
 	}
 	return 0;
 }
@@ -914,8 +919,21 @@ submit_ram2gpu_memcpy(strom_dma_task *dtask,
  * DMA transaction for SSD->GPU asynchronous copy
  */
 static int
-submit_ssd2gpu_memcpy(sector_t blocknr)
+submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 {
+	Assert(dtask->nr_blocks > 0);
+
+	prDebug("submit SSD2GPU src_block=%lu nr_blocks=%u dest_offset=%zu length=%zu",
+			dtask->src_block, dtask->nr_blocks, (size_t)dtask->dest_offset, (size_t)(PAGE_SIZE * dtask->nr_blocks));
+
+
+
+
+
+	dtask->dest_offset += PAGE_SIZE * dtask->nr_blocks;
+	dtask->src_block = -1UL;
+	dtask->nr_blocks = 0;
+
 	return 0;
 }
 
@@ -1031,6 +1049,8 @@ strom_memcpy_ssd2gpu_async(StromCmd__MemCpySsdToGpu __user *uarg,
 	dtask->refcnt = 1;
 	dtask->mgmem = mgmem;
 	dtask->dest_offset = mgmem->map_offset + karg.offset;
+	dtask->src_block = -1UL;
+	dtask->nr_blocks = 0;
 	dtask->filp = filp;
 	dtask->wait_task = NULL;
 	dtask->nchunks = karg.nchunks;
@@ -1093,6 +1113,19 @@ strom_memcpy_ssd2gpu_async(StromCmd__MemCpySsdToGpu __user *uarg,
 			fpage = find_get_page(filp->f_mapping, pos >> PAGE_SHIFT);
 			if (fpage)
 			{
+				/* submit SSD-to-GPU DMA, if pending */
+				if (dtask->nr_blocks > 0)
+				{
+					rc = submit_ssd2gpu_memcpy(dtask);
+					if (rc)
+					{
+						prDebug("submit_ssd2gpu_memcpy rc=%d", rc);
+						put_page(fpage);
+						break;
+					}
+					Assert(dtask->nr_blocks == 0);
+				}
+
 				/* submit RAM-to-GPU asynchronous memcpy */
 				rc = submit_ram2gpu_memcpy(dtask, fpage, offset, unitsz);
 				if (rc)
@@ -1117,12 +1150,41 @@ strom_memcpy_ssd2gpu_async(StromCmd__MemCpySsdToGpu __user *uarg,
 					prDebug("strom_get_block rc=%d", rc);
 					break;
 				}
-				/* submit SSD-to-GPU asynchronous memcpy */
-				rc = submit_ssd2gpu_memcpy(bh.b_blocknr);
+
+				/* merge with the pending blocks, if any */
+				if (dtask->nr_blocks > 0 &&
+					dtask->src_block + dtask->nr_blocks == bh.b_blocknr)
+				{
+					dtask->nr_blocks++;
+				}
+				else
+				{
+					/* submit the last pending blocks */
+					if (dtask->nr_blocks > 0)
+					{
+						rc = submit_ssd2gpu_memcpy(dtask);
+						if (rc)
+						{
+							prDebug("submit_ssd2gpu_memcpy rc=%d", rc);
+							break;
+						}
+						Assert(dtask->nr_blocks == 0);
+					}
+					dtask->src_block = bh.b_blocknr;
+					dtask->nr_blocks = 1;
+				}
 			}
 			pos += unitsz;
-			dtask->dest_offset += unitsz;
 		}
+	}
+
+	/* submit the last pending blocks, if any */
+	if (dtask->nr_blocks > 0)
+	{
+		rc = submit_ssd2gpu_memcpy(dtask);
+		if (rc)
+			prDebug("submit_ssd2gpu_memcpy rc=%d", rc);
+		Assert(dtask->nr_blocks == 0);
 	}
 	strom_put_dma_task(dtask);
 
