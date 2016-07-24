@@ -780,7 +780,7 @@ strom_put_dma_task(strom_dma_task *dtask)
 
 	spin_lock_irqsave(lock, flags);
 	Assert(dtask->refcnt > 0);
-	if (dtask->refcnt == 0)
+	if (--dtask->refcnt == 0)
 	{
 		list_del(&dtask->chain);
 		spin_unlock_irqrestore(lock, flags);
@@ -1030,7 +1030,7 @@ strom_memcpy_ssd2gpu_async(StromCmd__MemCpySsdToGpu __user *uarg,
 	dtask->hindex = strom_dma_task_index(dma_task_id);
 	dtask->refcnt = 1;
 	dtask->mgmem = mgmem;
-	dtask->dest_offset = karg.offset;
+	dtask->dest_offset = mgmem->map_offset + karg.offset;
 	dtask->filp = filp;
 	dtask->wait_task = NULL;
 	dtask->nchunks = karg.nchunks;
@@ -1053,7 +1053,7 @@ strom_memcpy_ssd2gpu_async(StromCmd__MemCpySsdToGpu __user *uarg,
 	i_size = i_size_read(filp->f_inode);
 	for (i=0; i < karg.nchunks; i++)
 	{
-		strom_dma_chunk *dchunk = &karg.chunks[i];
+		strom_dma_chunk *dchunk = &dtask->chunks[i];
 		loff_t		pos;
 		loff_t		end;
 
@@ -1068,11 +1068,14 @@ strom_memcpy_ssd2gpu_async(StromCmd__MemCpySsdToGpu __user *uarg,
 		}
 		end = Min(pos + dchunk->length, i_size);
 
+		prDebug("num_chunks = %u dchunk[%d] len=%zu pos=%zu", dtask->nchunks, i, (size_t)dchunk->length, (size_t)dchunk->file_pos);
+
 		/* alignment check */
 		if ((dtask->dest_offset & (STROM_MEMCPY_DST_ALIGN - 1)) != 0 ||
 			(pos & (STROM_MEMCPY_SRC_ALIGN - 1)) != 0 ||
 			(end & (STROM_MEMCPY_SRC_ALIGN - 1)) != 0)
 		{
+			prDebug("alignment error dest_offset=%zu pos=%zu end=%zu len=%zu i_size=%zu", dtask->dest_offset, (size_t)pos, (size_t)end, (size_t)dchunk->length, (size_t)i_size);
 			rc = -EINVAL;
 			break;
 		}
@@ -1094,6 +1097,7 @@ strom_memcpy_ssd2gpu_async(StromCmd__MemCpySsdToGpu __user *uarg,
 				rc = submit_ram2gpu_memcpy(dtask, fpage, offset, unitsz);
 				if (rc)
 				{
+					prDebug("submit_ram2gpu_memcpy rc=%d", rc);
 					put_page(fpage);
 					break;
 				}
@@ -1109,7 +1113,10 @@ strom_memcpy_ssd2gpu_async(StromCmd__MemCpySsdToGpu __user *uarg,
 									 pos >> PAGE_CACHE_SHIFT,
 									 &bh, 0);
 				if (rc)
+				{
+					prDebug("strom_get_block rc=%d", rc);
 					break;
+				}
 				/* submit SSD-to-GPU asynchronous memcpy */
 				rc = submit_ssd2gpu_memcpy(bh.b_blocknr);
 			}
@@ -1122,7 +1129,7 @@ strom_memcpy_ssd2gpu_async(StromCmd__MemCpySsdToGpu __user *uarg,
 	if (rc)
 	{
 		prDebug("wait for %lx due to errcode=%d", dma_task_id, rc);
-		(void)strom_memcpy_ssd2gpu_wait(dma_task_id);
+//		(void)strom_memcpy_ssd2gpu_wait(dma_task_id);
 	}
 	return rc;
 

@@ -69,8 +69,8 @@ struct strom_dma_chunk
 };
 typedef struct strom_dma_chunk	strom_dma_chunk;
 
-#define STROM_MEMCPY_SRC_ALIGN		512
-#define STROM_MEMCPY_DST_ALIGN		4
+#define STROM_MEMCPY_SRC_ALIGN		512UL
+#define STROM_MEMCPY_DST_ALIGN		4UL
 
 struct StromCmd__MemCpySsdToGpu
 {

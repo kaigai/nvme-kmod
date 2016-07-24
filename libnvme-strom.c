@@ -176,57 +176,49 @@ static void
 drivertest_dma_gpumem(const char *filename, int fdesc, size_t file_size,
 					  CUdeviceptr devptr, unsigned long handle)
 {
+	StromCmd__MemCpySsdToGpu uarg;
+	char	   *src_buffer;
+	void	   *dst_buffer;
+	char	   *pos;
+	ssize_t		retval;
+	CUresult	rc;
 
-
-#if 0
-	/*
-	 * RAM->GPU DMA Test
-	 */
-	if (do_host_dma_test)
+	src_buffer = malloc(file_size);
+	if (!src_buffer)
 	{
-		StromCmd__MemCpySsdToGpu dma_arg;
-		char	   *src_buffer;
-		void	   *dst_buffer;
-		char	   *pos;
-
-		src_buffer = malloc(required);
-		if (!src_buffer)
-		{
-			fprintf(stderr, "out of memory: %m\n");
-			exit(1);
-		}
-		rc = cuMemAllocHost(&dst_buffer, required);
-		cuda_exit_on_error(rc, "cuMemAllocHost");
-
-		/* fill up by random */
-		srand(time(NULL));
-		for (pos = src_buffer; pos < src_buffer + required; pos++)
-			*pos = (char)rand();
-
-		/* src_buffer -> GPU RAM */
-		dma_arg.handle = uarg.handle;
-		dma_arg.offset = 0;
-		dma_arg.fdesc = -1;
-		dma_arg.nchunks = 1;
-		dma_arg.chunks[0].length = required;
-		dma_arg.chunks[0].source = 'm';
-		dma_arg.chunks[0].u.host_addr = src_buffer;
-
-		retval = nvme_strom_ioctl(STROM_IOCTL__MEMCPY_SSD2GPU, &dma_arg);
-		printf("STROM_IOCTL__MEMCPY_SSD2GPU(%zu bytes) --> %d: %m\n",
-			   required, retval);
-
-		/* GPU RAM -> dst_buffer */
-		rc = cuMemcpyDtoH(dst_buffer, cuda_devptr, required);
-		cuda_exit_on_error(rc, "cuMemcpyDtoH");
-
-		/* compare results */
-		retval = memcmp(src_buffer, dst_buffer, required);
-		printf("memcmp(src, dst, %zu) --> %d\n", required, retval);
+		fprintf(stderr, "out of memory: %m\n");
+		exit(1);
 	}
-	return 0;
-}
-#endif
+	retval = read(fdesc, src_buffer, file_size);
+	if (retval != file_size)
+	{
+		fprintf(stderr, "failed on read(2) %zu bytes read but %zu required\n",
+				retval, file_size);
+		exit(1);
+	}
+
+	rc = cuMemAllocHost(&dst_buffer, file_size);
+	cuda_exit_on_error(rc, "cuMemAllocHost");
+
+	/* src_buffer -> GPU RAM */
+	uarg.handle = handle;
+	uarg.offset = 0;
+	uarg.fdesc = fdesc;
+	uarg.nchunks = 1;
+	uarg.chunks[0].file_pos = 0;
+	uarg.chunks[0].length = file_size;
+
+	retval = nvme_strom_ioctl(STROM_IOCTL__MEMCPY_SSD2GPU, &uarg);
+	printf("STROM_IOCTL__MEMCPY_SSD2GPU(%zu bytes) --> %d: %m\n",
+		   file_size, retval);
+
+	/* GPU RAM -> dst_buffer */
+	rc = cuMemcpyDtoH(dst_buffer, devptr, file_size);
+	cuda_exit_on_error(rc, "cuMemcpyDtoH");
+
+	/* compare results */
+	retval = memcmp(src_buffer, dst_buffer, file_size);
+	printf("memcmp(src, dst, %zu) --> %d\n", file_size, retval);
 }
 
 /*
@@ -237,6 +229,7 @@ int main(int argc, char * const argv[])
 	const char	   *filename;
 	int				fdesc = -1;
 	struct stat		stbuf;
+	size_t			filesize;
 	CUdeviceptr		devptr;
 	unsigned long	handle;
 	unsigned int	num_pages;
@@ -263,19 +256,20 @@ int main(int argc, char * const argv[])
 		fprintf(stderr, "failed on fstat(\"%s\"): %m\n", filename);
 		return 1;
 	}
+	filesize = (stbuf.st_size & ~(STROM_MEMCPY_SRC_ALIGN - 1));
 
 	/* is this file supported? */
 	drivertest_check_file(filename, fdesc);
 
 	/* if supported, try to alloc device memory */
-	drivertest_map_gpumem(filename, stbuf.st_size,
+	drivertest_map_gpumem(filename, filesize,
 						  &devptr, &handle, &num_pages);
 
 	/* print device memory map information */
 	drivertest_print_gpumem(handle, num_pages);
 
 	/* kick DMA from file to device memory */
-	drivertest_dma_gpumem(filename, fdesc, stbuf.st_size,
+	drivertest_dma_gpumem(filename, fdesc, filesize,
 						  devptr, handle);
 
 	return 0;
