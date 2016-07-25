@@ -528,7 +528,7 @@ strom_ioctl_info_gpu_memory(StromCmd__InfoGpuMemory __user *uarg)
 #define XFS_SB_MAGIC			0x58465342
 
 static int
-source_file_is_supported(struct file *filp)
+source_file_is_supported(struct file *filp, struct nvme_ns **p_nvme_ns)
 {
 	struct inode		   *f_inode = filp->f_inode;
 	struct super_block	   *i_sb = f_inode->i_sb;
@@ -659,6 +659,10 @@ source_file_is_supported(struct file *filp)
 				bd_disk->disk_name, rc);
 		return -ENOTSUPP;
 	}
+
+	if (p_nvme_ns)
+		*p_nvme_ns = (struct nvme_ns *)bd_disk->private_data;
+
 	/* OK, we assume the underlying device is supported NVMe-SSD */
 	return 0;
 }
@@ -701,7 +705,7 @@ strom_ioctl_check_file(StromCmd__CheckFile __user *uarg)
 	if (!filp)
 		return -EBADF;
 
-	rc = source_file_is_supported(filp);
+	rc = source_file_is_supported(filp, NULL);
 
 	fput(filp);
 
@@ -731,6 +735,8 @@ struct strom_dma_task
 	unsigned int		nr_blocks;	/* num of blocks pending for submit */
 	struct file		   *filp;		/* source file, if any */
 	struct task_struct *wait_task;	/* task which wait for completion */
+	int					dma_status;
+	u32					dma_result;
 	/* definition of the chunks */
 	unsigned int		nchunks;
 	strom_dma_chunk		chunks[1];
@@ -918,23 +924,180 @@ submit_ram2gpu_memcpy(strom_dma_task *dtask,
 /*
  * DMA transaction for SSD->GPU asynchronous copy
  */
+struct strom_dma_request {
+	struct request	   *req;
+	strom_dma_task	   *dtask;
+};
+typedef struct strom_dma_request	strom_dma_request;
+
+static void
+callback_ssd2gpu_memcpy(struct nvme_queue *nvmeq, void *ctx,
+						struct nvme_completion *cqe)
+{
+	strom_dma_request  *dreq = (strom_dma_request *) ctx;
+	strom_dma_task	   *dtask = dreq->dtask;
+	int					dma_status = le16_to_cpup(&cqe->status) >> 1;
+	u32					dma_result = le32_to_cpup(&cqe->result);
+
+	/* update execution result, if error */
+	if (dma_status != NVME_SC_SUCCESS)
+	{
+		spinlock_t	   *lock = &strom_dma_task_locks[dtask->hindex];
+		unsigned long	flags;
+
+		spin_lock_irqsave(lock, flags);
+		if (dtask->dma_status == NVME_SC_SUCCESS)
+		{
+			dtask->dma_status = dma_status;
+			dtask->dma_result = dma_result;
+		}
+		spin_unlock_irqrestore(lock, flags);
+	}
+
+	/* release resources and wake up waiter */
+	blk_mq_free_request(dreq->req);
+	strom_put_dma_task(dreq->dtask);
+	kfree(dreq);
+}
+
+/* A series of command sequence to submit NVME commands */
+#if defined(RHEL_MAJOR) && (RHEL_MAJOR == 7)
+/**
+ * nvme_submit_cmd() - Copy a command into a queue and ring the doorbell
+ * @nvmeq: The queue to use
+ * @cmd: The command to send
+ *
+ * Safe to use from interrupt context
+ */
+static inline int
+__nvme_submit_cmd(struct nvme_queue *nvmeq, struct nvme_command *cmd)
+{
+	u16 tail = nvmeq->sq_tail;
+
+	memcpy(&nvmeq->sq_cmds[tail], cmd, sizeof(*cmd));
+	if (++tail == nvmeq->q_depth)
+		tail = 0;
+	writel(tail, nvmeq->q_db);
+	nvmeq->sq_tail = tail;
+
+	return 0;
+}
+
+static inline int
+nvme_submit_cmd(struct nvme_queue *nvmeq, struct nvme_command *cmd)
+{
+	unsigned long flags;
+	int ret;
+
+	spin_lock_irqsave(&nvmeq->q_lock, flags);
+	ret = __nvme_submit_cmd(nvmeq, cmd);
+	spin_unlock_irqrestore(&nvmeq->q_lock, flags);
+	return ret;
+}
+
+/*
+ * nvme_submit_io_cmd_async - It submits an I/O command of NVME-SSD, and then
+ * returns to the caller immediately. Callback will put the strom_dma_task,
+ * thus, strom_memcpy_ssd2gpu_wait() allows synchronization of DMA completion.
+ */
+static int
+nvme_submit_async_cmd(strom_dma_task *dtask, struct nvme_command *cmd)
+{
+	struct nvme_ns		   *nvme_ns = dtask->nvme_ns;
+	struct request		   *req;
+	struct nvme_cmd_info   *cmd_rq;
+	strom_dma_request	   *dreq;
+	int						retval;
+
+	dreq = kzalloc(sizeof(strom_dma_request));
+	if (!dreq)
+		return -ENOMEM;
+
+	req = blk_mq_alloc_request(nvme_ns->queue,
+							   WRITE,
+							   GFP_KERNEL|__GFP_WAIT,
+							   false);
+	if (IS_ERR(req))
+	{
+		kfree(dreq);
+		return PTR_ERR(req);
+	}
+	dreq->req = req;
+	dreq->dtask = strom_get_dma_task(dtask);
+
+	cmd_rq = blk_mq_rq_to_pdu(req);
+	cmd_rq->fn = callback_ssd2gpu_memcpy;
+	cmd_rq->ctx = dreq;
+	cmd_rq->aborted = 0;
+	blk_mq_start_request(blk_mq_rq_from_pdu(cmd_rq));
+
+	cmd->common.command_id = req->tag;
+
+	nvme_submit_cmd(cmd_rq->nvmeq, cmd);
+
+	return 0;
+}
+#endif
+
 static int
 submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 {
+	struct nvme_command	cmd;
+	struct nvme_ns	   *nvme_ns = dtask->nvme_ns;
+	struct nvme_dev	   *nvme_dev = nvme_ns->dev;
+	int					retval;
+
 	Assert(dtask->nr_blocks > 0);
 
-	prDebug("submit SSD2GPU src_block=%lu nr_blocks=%u dest_offset=%zu length=%zu",
-			dtask->src_block, dtask->nr_blocks, (size_t)dtask->dest_offset, (size_t)(PAGE_SIZE * dtask->nr_blocks));
+	prDebug("Submit SSD2GPU src_block=%lu nr_blocks=%u dest_ofs=%zu len=%zu",
+			dtask->src_block, dtask->nr_blocks,
+			(size_t)dtask->dest_offset,
+			(size_t)(PAGE_SIZE * dtask->nr_blocks));
 
+	/* setup command */
+	memset(&cmd, 0, sizeof(rw_cmd));
+	cmd.rw.opcode = nvme_cmd_read;
+	cmd.rw.flags = ;
+	cmd.rw.nsid = cpu_to_le32(nvme_ns->ns_id);
+	cmd.rw.prp1 = cpu_to_le64(sg_dma_address(iod->sg));
+	cmd.rw.prp2 = cpu_to_le64(iod->first_dma);
+	cmd.rw.slba = cpu_to_le64(io.slba);
+	cmd.rw.length = cpu_to_le16(io.nblocks);
+	cmd.rw.control = cpu_to_le16(io.control);
+	cmd.rw.dsmgmt = cpu_to_le32(io.dsmgmt);
+	cmd.rw.reftag = cpu_to_le32(io.reftag);
+	cmd.rw.apptag = cpu_to_le16(io.apptag);
+	cmd.rw.appmask = cpu_to_le16(io.appmask);
 
-
-
+#if 0
+	struct nvme_rw_command {
+		__u8            opcode;			//   0:7	nvme_cmd_read
+		__u8            flags;			//   8:15
+		__u16           command_id;		//  16:31	req->tag
+		__le32          nsid;			//  32:63	ns->ns_id
+		__u64           rsvd2;			//  64:127	
+		__le64          metadata;		// 128:191
+		__le64          prp1;			// sg_dma_address()
+		__le64          prp2;			// iod->first_dma;see nvme_setup_prps()
+		__le64          slba;			// cdw10 + cdw11
+		// cdw10 lower 32bit
+		// cdw11 upper 32bit
+		__le16          length;			// cdw12
+		__le16          control;		//   :  ... some flags
+		__le32          dsmgmt;			// cdw13; dataset management
+		// valid only 8bit
+		__le32          reftag;			// cdw14
+		__le16          apptag;			// cdw15
+		__le16          appmask;		//   :
+	};
+#endif
+	retval = nvme_submit_async_cmd(dtask, (struct nvme_command *)&rw_cmd);
 
 	dtask->dest_offset += PAGE_SIZE * dtask->nr_blocks;
 	dtask->src_block = -1UL;
 	dtask->nr_blocks = 0;
 
-	return 0;
+	return retval;
 }
 
 /*
@@ -1005,6 +1168,7 @@ strom_memcpy_ssd2gpu_async(StromCmd__MemCpySsdToGpu __user *uarg,
 	strom_dma_task	   *dtask;
 	struct file		   *filp;
 	struct page		   *fpage;
+	struct nvme_ns	   *nvme_ns;
 	loff_t				i_size;
 	unsigned long		dma_task_id;
 	unsigned long		flags;
@@ -1023,7 +1187,7 @@ strom_memcpy_ssd2gpu_async(StromCmd__MemCpySsdToGpu __user *uarg,
 				karg.fdesc, current->tgid);
 		return -EBADF;
 	}
-	rc = source_file_is_supported(filp);
+	rc = source_file_is_supported(filp, &nvme_ns);
 	if (rc < 0)
 		goto error_1;
 
@@ -1052,6 +1216,7 @@ strom_memcpy_ssd2gpu_async(StromCmd__MemCpySsdToGpu __user *uarg,
 	dtask->src_block = -1UL;
 	dtask->nr_blocks = 0;
 	dtask->filp = filp;
+	dtask->nvme_ns = nvme_ns;
 	dtask->wait_task = NULL;
 	dtask->nchunks = karg.nchunks;
 	if (copy_from_user(dtask->chunks, uarg->chunks,
