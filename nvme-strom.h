@@ -25,6 +25,7 @@ enum {
 struct StromCmd__CheckFile
 {
 	int				fdesc;		/* in: file descriptor to be checked */
+	size_t			falign;		/* out: required alignment size */
 };
 typedef struct StromCmd__CheckFile		StromCmd__CheckFile;
 
@@ -64,13 +65,10 @@ typedef struct StromCmd__InfoGpuMemory	StromCmd__InfoGpuMemory;
 /* STROM_IOCTL__MEMCPY_SSD2GPU and STROM_IOCTL__MEMCPY_SSD2GPU_ASYNC */
 struct strom_dma_chunk
 {
-	loff_t			file_pos;	/* in: file offset from the head */
+	loff_t			fpos;		/* in: file position from the head */
 	size_t			length;		/* in: length of this chunk */
 };
 typedef struct strom_dma_chunk	strom_dma_chunk;
-
-#define STROM_MEMCPY_SRC_ALIGN		512UL
-#define STROM_MEMCPY_DST_ALIGN		4UL
 
 struct StromCmd__MemCpySsdToGpu
 {

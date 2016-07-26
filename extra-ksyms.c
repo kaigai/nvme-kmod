@@ -106,40 +106,6 @@ __xfs_get_blocks(struct inode *inode, sector_t offset,
 	return p_xfs_get_blocks(inode, offset, bh, create);
 }
 
-#ifdef STROM_TARGET_KERNEL_RHEL7
-/* nvme_setup_prps */
-static struct module *mod_nvme_setup_prps = NULL;
-static int (* p_nvme_setup_prps)(struct nvme_dev *dev,
-								 struct nvme_iod *iod,
-								 int total_len, gfp_t gfp) = NULL;
-static inline int
-__nvme_setup_prps(struct nvme_dev *dev,
-				  struct nvme_iod *iod,
-				  int total_len, gfp_t gfp)
-{
-	if (unlikely(!p_nvme_setup_prps))
-		return -EINVAL;
-	return p_nvme_setup_prps(dev, iod, total_len, gfp);
-}
-
-/* nvme_submit_io_cmd */
-static struct module *mod_nvme_submit_io_cmd = NULL;
-static int (* p_nvme_submit_io_cmd)(struct nvme_dev *dev,
-									struct nvme_ns *ns,
-									struct nvme_command *cmd,
-									u32 *result) = NULL;
-static inline int
-__nvme_submit_io_cmd(struct nvme_dev *dev,
-					 struct nvme_ns *ns,
-					 struct nvme_command *cmd,
-					 u32 *result)
-{
-	if (unlikely(!p_nvme_submit_io_cmd))
-		return -EINVAL;
-	return p_nvme_submit_io_cmd(dev, ns, cmd, result);
-}
-#endif
-
 /*
  * __strom_lookup_extra_symbol - lookup extra symbol and grab module if any
  */
@@ -200,7 +166,6 @@ strom_update_extra_symbols(struct notifier_block *nb,
 	LOOKUP_OPTIONAL_EXTRA_SYMBOL(xfs_get_blocks);
 
 	return 0;
-#undef LOOKUP_OPTIONAL_EXTRA_SYMBOL
 }
 
 /* notifier of extra symbols */
@@ -215,10 +180,6 @@ strom_put_all_extra_modules(void)
 	module_put(mod_nvidia_p2p_get_pages);
 	module_put(mod_nvidia_p2p_put_pages);
 	module_put(mod_nvidia_p2p_free_page_table);
-#ifdef STROM_TARGET_KERNEL_RHEL7
-	module_put(mod_nvme_setup_prps);
-	module_put(mod_nvme_submit_io_cmd);
-#endif
 	module_put(mod_ext4_get_block);
 	module_put(mod_xfs_get_blocks);
 }
@@ -255,11 +216,6 @@ strom_init_extra_symbols(void)
 	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvidia_p2p_get_pages);
 	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvidia_p2p_put_pages);
 	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvidia_p2p_free_page_table);
-#ifdef STROM_TARGET_KERNEL_RHEL7
-	/* nvme.ko */
-	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvme_setup_prps);
-	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvme_submit_io_cmd);
-#endif
 
 	/* notifier to get optional extra symbols */
 	rc = register_module_notifier(&nvme_strom_nb);
