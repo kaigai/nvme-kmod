@@ -68,28 +68,17 @@ nvme_callback_async_read_cmd(struct nvme_queue *nvmeq, void *ctx,
 							 struct nvme_completion *cqe)
 {
 	strom_dma_request  *dma_req = (strom_dma_request *) ctx;
-	strom_dma_task	   *dtask = dma_req->dtask;
 	int					dma_status = le16_to_cpup(&cqe->status) >> 1;
-	u32					dma_result = le32_to_cpup(&cqe->result);
+//	u32					dma_result = le32_to_cpup(&cqe->result);
 
-	/* update execution result, if error */
-	if (dma_status != NVME_SC_SUCCESS)
-	{
-		spinlock_t	   *lock = &strom_dma_task_locks[dtask->hindex];
-		unsigned long	flags;
-
-		spin_lock_irqsave(lock, flags);
-		if (dtask->dma_status == NVME_SC_SUCCESS)
-		{
-			dtask->dma_status = dma_status;
-			dtask->dma_result = dma_result;
-		}
-		spin_unlock_irqrestore(lock, flags);
-	}
+	/*
+	 * FIXME: dma_status is one of NVME_SC_* (like NVME_SC_SUCCESS)
+	 * We have to translate it to host understandable error code
+	 */
 
 	/* release resources and wake up waiter */
 	blk_mq_free_request(dma_req->req);
-	strom_put_dma_task(dma_req->dtask);
+	strom_put_dma_task(dma_req->dtask, dma_status);
 	kfree(dma_req);
 }
 
