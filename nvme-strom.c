@@ -770,6 +770,7 @@ struct strom_dma_task
 	struct task_struct *wait_task;	/* task which waits for completion */
 	int					dma_status;
 	u32					dma_result;
+
 	/* definition of the chunks */
 	unsigned int		nchunks;
 	strom_dma_chunk		chunks[1];
@@ -931,7 +932,6 @@ submit_ram2gpu_memcpy(strom_dma_task *dtask)
 static int
 submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 {
-	struct nvme_command	cmd;
 	struct nvme_ns	   *nvme_ns = dtask->nvme_ns;
 	mapped_gpu_memory  *mgmem = dtask->mgmem;
 	size_t		src_offset  = dtask->src_offset;
@@ -965,22 +965,7 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 		dma_addr = (mgmem->page_table->pages[i]->physical_address +
 					(dest_offset & (mgmem->gpu_page_sz - 1)));
 
-		/* setup a NVME-SSD command */
-		memset(&cmd, 0, sizeof(cmd));
-		cmd.rw.opcode = nvme_cmd_read;
-		cmd.rw.flags = 0;	/* right? */
-		cmd.rw.nsid = cpu_to_le32(nvme_ns->ns_id);
-		cmd.rw.prp1 = cpu_to_le64(dma_addr);
-		cmd.rw.prp2 = cpu_to_le64(0UL);	/* right? */
-		cmd.rw.slba = cpu_to_le64(slba);
-		cmd.rw.length = cpu_to_le16(nlb);
-		cmd.rw.control = cpu_to_le16(control);	/* check it later */
-		cmd.rw.dsmgmt = cpu_to_le32(dsmgmt);	/* check it later */
-		cmd.rw.reftag = cpu_to_le32(reftag);	/* check it later */
-		cmd.rw.apptag = cpu_to_le16(apptag);	/* check it later */
-		cmd.rw.appmask = cpu_to_le16(appmask);	/* check it later */
-
-		retval = nvme_submit_async_cmd(dtask, &cmd);
+		retval = nvme_submit_async_read_cmd(dtask, dma_addr, slba, nlb);
 		if (retval)
 			break;
 
@@ -996,29 +981,6 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 	dtask->dma_length = 0;
 
 	return retval;
-
-#if 0
-	struct nvme_rw_command {
-		__u8            opcode;			//   0:7	nvme_cmd_read
-		__u8            flags;			//   8:15
-		__u16           command_id;		//  16:31	req->tag
-		__le32          nsid;			//  32:63	ns->ns_id
-		__u64           rsvd2;			//  64:127	
-		__le64          metadata;		// 128:191
-		__le64          prp1;			// sg_dma_address()
-		__le64          prp2;			// iod->first_dma;see nvme_setup_prps()
-		__le64          slba;			// cdw10 + cdw11
-		// cdw10 lower 32bit
-		// cdw11 upper 32bit
-		__le16          length;			// cdw12
-		__le16          control;		//   :  ... some flags
-		__le32          dsmgmt;			// cdw13; dataset management
-		// valid only 8bit
-		__le32          reftag;			// cdw14
-		__le16          apptag;			// cdw15
-		__le16          appmask;		//   :
-	};
-#endif
 }
 
 /*
@@ -1488,6 +1450,7 @@ strom_ioctl_debug(StromCmd__Debug __user *uarg)
  */
 typedef struct
 {
+	/* contents of read(2) */
 	size_t		length;
 	size_t		usage;
 	char		data[1];
@@ -1587,6 +1550,7 @@ strom_proc_open(struct inode *inode, struct file *filp)
 
 	if (!spent)
 		return -ENOMEM;
+
 	filp->private_data = spent;
 
 	return 0;
@@ -1617,6 +1581,7 @@ static int
 strom_proc_release(struct inode *inode, struct file *filp)
 {
 	strom_proc_entry   *spent = filp->private_data;
+
 	if (spent)
 		kfree(spent);
 	return 0;
@@ -1627,7 +1592,7 @@ strom_proc_ioctl(struct file *filp,
 				 unsigned int cmd,
 				 unsigned long arg)
 {
-	int		rc;
+	int			rc;
 
 	switch (cmd)
 	{

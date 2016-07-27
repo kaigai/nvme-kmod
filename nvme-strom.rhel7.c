@@ -12,11 +12,10 @@
 
 
 struct strom_dma_request {
-	struct request	   *req;
 	strom_dma_task	   *dtask;
+	struct request	   *req;
 };
 typedef struct strom_dma_request	strom_dma_request;
-
 
 struct async_cmd_info {
 	struct kthread_work work;
@@ -65,11 +64,11 @@ struct nvme_cmd_info {
 };
 
 static void
-callback_ssd2gpu_memcpy(struct nvme_queue *nvmeq, void *ctx,
-						struct nvme_completion *cqe)
+nvme_callback_async_read_cmd(struct nvme_queue *nvmeq, void *ctx,
+							 struct nvme_completion *cqe)
 {
-	strom_dma_request  *dreq = (strom_dma_request *) ctx;
-	strom_dma_task	   *dtask = dreq->dtask;
+	strom_dma_request  *dma_req = (strom_dma_request *) ctx;
+	strom_dma_task	   *dtask = dma_req->dtask;
 	int					dma_status = le16_to_cpup(&cqe->status) >> 1;
 	u32					dma_result = le32_to_cpup(&cqe->result);
 
@@ -89,9 +88,9 @@ callback_ssd2gpu_memcpy(struct nvme_queue *nvmeq, void *ctx,
 	}
 
 	/* release resources and wake up waiter */
-	blk_mq_free_request(dreq->req);
-	strom_put_dma_task(dreq->dtask);
-	kfree(dreq);
+	blk_mq_free_request(dma_req->req);
+	strom_put_dma_task(dma_req->dtask);
+	kfree(dma_req);
 }
 
 /* -- copy from nvme-core.c -- */
@@ -129,21 +128,34 @@ nvme_submit_cmd(struct nvme_queue *nvmeq, struct nvme_command *cmd)
 	return ret;
 }
 
+static void
+nvme_set_info(struct nvme_cmd_info *cmd, void *ctx, nvme_completion_fn handler)
+{
+	cmd->fn = handler;
+	cmd->ctx = ctx;
+	cmd->aborted = 0;
+	blk_mq_start_request(blk_mq_rq_from_pdu(cmd));
+}
+
 /*
  * nvme_submit_io_cmd_async - It submits an I/O command of NVME-SSD, and then
  * returns to the caller immediately. Callback will put the strom_dma_task,
  * thus, strom_memcpy_ssd2gpu_wait() allows synchronization of DMA completion.
  */
 static int
-nvme_submit_async_cmd(strom_dma_task *dtask, struct nvme_command *cmd)
+nvme_submit_async_read_cmd(strom_dma_task *dtask,
+						   uint64_t dma_addr, uint64_t slba, u16 nlb)
 {
 	struct nvme_ns		   *nvme_ns = dtask->nvme_ns;
 	struct request		   *req;
 	struct nvme_cmd_info   *cmd_rq;
-	strom_dma_request	   *dreq;
+	struct nvme_command		cmd;
+	strom_dma_request	   *dma_req;
+	u16						control = 0;
+	u32						dsmgmt = 0;
 
-	dreq = kzalloc(sizeof(strom_dma_request), GFP_KERNEL);
-	if (!dreq)
+	dma_req = kzalloc(sizeof(strom_dma_request), GFP_KERNEL);
+	if (!dma_req)
 		return -ENOMEM;
 
 	req = blk_mq_alloc_request(nvme_ns->queue,
@@ -152,21 +164,40 @@ nvme_submit_async_cmd(strom_dma_task *dtask, struct nvme_command *cmd)
 							   false);
 	if (IS_ERR(req))
 	{
-		kfree(dreq);
+		kfree(dma_req);
 		return PTR_ERR(req);
 	}
-	dreq->req = req;
-	dreq->dtask = strom_get_dma_task(dtask);
+	dma_req->req = req;
+	dma_req->dtask = strom_get_dma_task(dtask);
 
+	/* setup READ command */
+	if (req->cmd_flags & REQ_FUA)
+		control |= NVME_RW_FUA;
+	if (req->cmd_flags & (REQ_FAILFAST_DEV | REQ_RAHEAD))
+		control |= NVME_RW_LR;
+	if (req->cmd_flags & REQ_RAHEAD)
+		dsmgmt |= NVME_RW_DSM_FREQ_PREFETCH;
+
+	memset(&cmd, 0, sizeof(struct nvme_command));
+	cmd.rw.opcode		= nvme_cmd_read;
+	cmd.rw.flags		= 0;	/* we use PRPs, rather than SGL */
+	cmd.rw.command_id	= req->tag;
+	cmd.rw.nsid			= cpu_to_le32(nvme_ns->ns_id);
+	cmd.rw.prp1			= cpu_to_le64(dma_addr);
+	cmd.rw.prp2			= cpu_to_le64(dma_addr); // right?
+	cmd.rw.metadata		= 0; //??? integrity check?;
+	cmd.rw.slba			= cpu_to_le64(slba);
+	cmd.rw.length		= cpu_to_le16(nlb);
+	cmd.rw.control		= cpu_to_le16(control);
+	cmd.rw.dsmgmt		= cpu_to_le32(dsmgmt);
+	/*
+	 * 'reftag', 'apptag' and 'appmask' fields are used only when nvme-
+	 * namespace is formatted to use end-to-end protection information.
+	 * Linux kernel of RHEL7 does not use these fields.
+	 */
 	cmd_rq = blk_mq_rq_to_pdu(req);
-	cmd_rq->fn = callback_ssd2gpu_memcpy;
-	cmd_rq->ctx = dreq;
-	cmd_rq->aborted = 0;
-	blk_mq_start_request(blk_mq_rq_from_pdu(cmd_rq));
-
-	cmd->common.command_id = req->tag;
-
-	nvme_submit_cmd(cmd_rq->nvmeq, cmd);
+	nvme_set_info(cmd_rq, dma_req, nvme_callback_async_read_cmd);
+	nvme_submit_cmd(cmd_rq->nvmeq, &cmd);
 
 	return 0;
 }

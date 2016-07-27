@@ -83,17 +83,20 @@ drivertest_debug(void)
 }
 
 static void
-drivertest_check_file(const char *filename, int fdesc)
+drivertest_check_file(const char *filename, int fdesc, size_t *p_falign)
 {
 	StromCmd__CheckFile uarg;
 	int		rc;
 
+	memset(&uarg, 0, sizeof(uarg));
 	uarg.fdesc = fdesc;
 
 	rc = nvme_strom_ioctl(STROM_IOCTL__CHECK_FILE, &uarg);
-	printf("STROM_IOCTL__CHECK_FILE('%s') --> %d : %m\n", filename, rc);
+	printf("STROM_IOCTL__CHECK_FILE('%s') --> %d (falign=%zu): %m\n",
+		   filename, uarg.falign, rc);
 	if (rc)
 		exit(rc);
+	*p_falign = uarg.falign;
 }
 
 static void
@@ -205,7 +208,7 @@ drivertest_dma_gpumem(const char *filename, int fdesc, size_t file_size,
 	uarg.offset = 0;
 	uarg.fdesc = fdesc;
 	uarg.nchunks = 1;
-	uarg.chunks[0].file_pos = 0;
+	uarg.chunks[0].fpos = 0;
 	uarg.chunks[0].length = file_size;
 
 	retval = nvme_strom_ioctl(STROM_IOCTL__MEMCPY_SSD2GPU, &uarg);
@@ -230,6 +233,7 @@ int main(int argc, char * const argv[])
 	int				fdesc = -1;
 	struct stat		stbuf;
 	size_t			filesize;
+	size_t			falign;
 	CUdeviceptr		devptr;
 	unsigned long	handle;
 	unsigned int	num_pages;
@@ -256,10 +260,10 @@ int main(int argc, char * const argv[])
 		fprintf(stderr, "failed on fstat(\"%s\"): %m\n", filename);
 		return 1;
 	}
-	filesize = (stbuf.st_size & ~(STROM_MEMCPY_SRC_ALIGN - 1));
 
 	/* is this file supported? */
-	drivertest_check_file(filename, fdesc);
+	drivertest_check_file(filename, fdesc, &falign);
+	filesize = (stbuf.st_size & ~(falign - 1));
 
 	/* if supported, try to alloc device memory */
 	drivertest_map_gpumem(filename, filesize,
