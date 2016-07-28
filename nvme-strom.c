@@ -111,6 +111,7 @@ static struct proc_dir_entry  *nvme_strom_proc = NULL;
 struct mapped_gpu_memory
 {
 	struct list_head	chain;		/* chain to the strom_mgmem_slots[] */
+	int					hindex;		/* index of the hash slot */
 	int					refcnt;		/* number of the concurrent tasks */
 	pid_t				owner;		/* PID who mapped this device memory */
 	unsigned long		handle;		/* identifier of this entry */
@@ -150,7 +151,7 @@ struct mapped_gpu_memory
 typedef struct mapped_gpu_memory	mapped_gpu_memory;
 
 #define MAPPED_GPU_MEMORY_NSLOTS	48
-static struct mutex		strom_mgmem_mutex[MAPPED_GPU_MEMORY_NSLOTS];
+static spinlock_t		strom_mgmem_locks[MAPPED_GPU_MEMORY_NSLOTS];
 static struct list_head	strom_mgmem_slots[MAPPED_GPU_MEMORY_NSLOTS];
 
 /*
@@ -171,27 +172,29 @@ static mapped_gpu_memory *
 strom_get_mapped_gpu_memory(unsigned long handle)
 {
 	int					index = strom_mapped_gpu_memory_index(handle);
-	struct mutex	   *mutex = &strom_mgmem_mutex[index];
-	struct list_head   *slot  = &strom_mgmem_slots[index];
+	spinlock_t		   *lock = &strom_mgmem_locks[index];
+	struct list_head   *slot = &strom_mgmem_slots[index];
 	mapped_gpu_memory  *mgmem;
 
-	mutex_lock(mutex);
+	spin_lock(lock);
 	list_for_each_entry(mgmem, slot, chain)
 	{
-		if (mgmem->handle != handle)
-			continue;
+		if (mgmem->handle == handle &&
+			mgmem->owner  == current->tgid)
+		{
+			/* sanity checks */
+			Assert((unsigned long)mgmem == handle);
+			Assert(mgmem->hindex == index);
 
-		/* sanity checks */
-		BUG_ON((unsigned long)mgmem != handle);
-		BUG_ON(!mgmem->page_table);
+			mgmem->refcnt++;
+			spin_unlock(lock);
 
-		mgmem->refcnt++;
-		mutex_unlock(mutex);
-		return mgmem;
+			return mgmem;
+		}
 	}
-	mutex_unlock(mutex);
+	spin_unlock(lock);
 
-	prError("P2P GPU Memory (handle=0x%lx) not found", handle);
+	prError("P2P GPU Memory (handle=%lx) not found", handle);
 
 	return NULL;	/* not found */
 }
@@ -199,108 +202,89 @@ strom_get_mapped_gpu_memory(unsigned long handle)
 /*
  * strom_put_mapped_gpu_memory
  */
-static inline void
-__strom_put_mapped_gpu_memory(mapped_gpu_memory *mgmem)
-{
-	BUG_ON(mgmem->refcnt < 1);
-	mgmem->refcnt--;
-	if (mgmem->refcnt == 0 && mgmem->wait_task != NULL)
-	{
-		wake_up_process(mgmem->wait_task);
-		mgmem->wait_task = NULL;
-	}
-}
-
 static void
 strom_put_mapped_gpu_memory(mapped_gpu_memory *mgmem)
 {
-	int				index = strom_mapped_gpu_memory_index(mgmem->handle);
-	struct mutex   *mutex = &strom_mgmem_mutex[index];
+	int		index = mgmem->hindex;
 
-	mutex_lock(mutex);
-	__strom_put_mapped_gpu_memory(mgmem);
-	mutex_unlock(mutex);
+	spin_lock(&strom_mgmem_locks[index]);
+	Assert(mgmem->refcnt > 0);
+	if (--mgmem->refcnt == 0)
+	{
+		if (mgmem->wait_task != NULL)
+		{
+			wake_up_process(mgmem->wait_task);
+			mgmem->wait_task = NULL;
+		}
+	}
+	spin_unlock(&strom_mgmem_locks[index]);
 }
 
 /*
- * strom_clenup_mapped_gpu_memory - remove P2P page tables
+ * callback_release_mapped_gpu_memory
  */
-static int
-__strom_clenup_mapped_gpu_memory(unsigned long handle)
+static void
+callback_release_mapped_gpu_memory(void *private)
 {
-	int					index = strom_mapped_gpu_memory_index(handle);
-	struct mutex	   *mutex = &strom_mgmem_mutex[index];
-	struct list_head   *slot = &strom_mgmem_slots[index];
-	struct task_struct *wait_task_saved;
-	mapped_gpu_memory  *mgmem;
+	mapped_gpu_memory  *mgmem = private;
+	spinlock_t		   *lock = &strom_mgmem_locks[mgmem->hindex];
+	unsigned long		handle = mgmem->handle;
 	unsigned int		entries;
 	int					i, rc;
 
-	mutex_lock(mutex);
-	list_for_each_entry(mgmem, slot, chain)
+	/* sanity check */
+	Assert((unsigned long)mgmem == handle);
+
+	spin_lock(lock);
+	/*
+	 * Detach this mapped GPU memory from the global list first, if
+	 * application didn't unmap explicitly.
+	 */
+	if (mgmem->chain.next || mgmem->chain.prev)
 	{
-		if (mgmem->handle != handle)
-			continue;
-
-		/* sanity check */
-		BUG_ON((unsigned long)mgmem != handle);
-		BUG_ON(!mgmem->page_table);
-
-		/*
-		 * detach entry; no concurrent task can never touch this
-		 * entry any more.
-		 */
 		list_del(&mgmem->chain);
-
-		/*
-		 * needs to wait for completion of concurrent DMA completion,
-		 * if any task are running on.
-		 */
-		if (mgmem->refcnt > 0)
-		{
-			wait_task_saved = mgmem->wait_task;
-			mgmem->wait_task = current;
-
-			/* sleep until refcnt == 0 */
-			set_current_state(TASK_UNINTERRUPTIBLE);
-            mutex_unlock(mutex);
-			schedule();
-
-			if (wait_task_saved)
-				wake_up_process(wait_task_saved);
-
-			mutex_lock(mutex);
-			BUG_ON(mgmem->refcnt == 0);
-		}
-		mutex_unlock(mutex);
-
-		/*
-		 * OK, no concurrent task does not use this mapped GPU memory
-		 * at this point. So, we have no problem to release page_table.
-		 */
-		entries = mgmem->page_table->entries;
-		for (i=0; i < entries; i++)
-			iounmap(mgmem->iomap_vaddrs[i]);
-		kfree(mgmem->iomap_vaddrs);
-
-		rc = __nvidia_p2p_free_page_table(mgmem->page_table);
-		if (rc)
-			prError("nvidia_p2p_free_page_table (handle=0x%lx, rc=%d)",
-					handle, rc);
-		kfree(mgmem);
-
-		prInfo("P2P GPU Memory (handle=%p) was released", (void *)handle);
-		return 0;
+		memset(&mgmem->chain, 0, sizeof(struct list_head));
 	}
-	mutex_unlock(mutex);
-	prError("P2P GPU Memory (handle=%p) already released", (void *)handle);
-	return -ENOENT;
-}
 
-static void
-strom_cleanup_mapped_gpu_memory(void *private)
-{
-	(void)__strom_clenup_mapped_gpu_memory((unsigned long) private);
+	/*
+	 * wait for completion of the concurrent DMA tasks, if any tasks
+	 * are running.
+	 */
+	if (mgmem->refcnt > 0)
+	{
+		struct task_struct *wait_task_saved = mgmem->wait_task;
+
+		mgmem->wait_task = current;
+		/* sleep until refcnt == 0 */
+		set_current_state(TASK_UNINTERRUPTIBLE);
+		spin_unlock(lock);
+
+		schedule();
+
+		if (wait_task_saved)
+			wake_up_process(wait_task_saved);
+
+		spin_lock(lock);
+		Assert(mgmem->refcnt == 0);
+	}
+	spin_unlock(lock);
+
+	/*
+	 * OK, no concurrent task does not use this mapped GPU memory region
+	 * at this point. So, we can release the page table and relevant safely.
+	 */
+	entries = mgmem->page_table->entries;
+	for (i=0; i < entries; i++)
+		iounmap(mgmem->iomap_vaddrs[i]);
+	kfree(mgmem->iomap_vaddrs);
+
+	rc = __nvidia_p2p_free_page_table(mgmem->page_table);
+	if (rc)
+		prError("nvidia_p2p_free_page_table (handle=0x%lx, rc=%d)",
+				handle, rc);
+	kfree(mgmem);
+
+	prInfo("P2P GPU Memory (handle=%p) was released", (void *)handle);
 }
 
 /*
@@ -316,6 +300,7 @@ strom_ioctl_map_gpu_memory(StromCmd__MapGpuMemory __user *uarg)
 	nvidia_p2p_page_t **p2p_pages;
 	unsigned long	map_address;
 	unsigned long	map_offset;
+	unsigned long	handle;
 	uint32_t		entries;
 	int				i, rc;
 
@@ -328,11 +313,13 @@ strom_ioctl_map_gpu_memory(StromCmd__MapGpuMemory __user *uarg)
 
 	map_address = karg.vaddress & GPU_BOUND_MASK;
 	map_offset  = karg.vaddress & GPU_BOUND_OFFSET;
+	handle = (unsigned long) mgmem;
 
 	INIT_LIST_HEAD(&mgmem->chain);
+	mgmem->hindex		= strom_mapped_gpu_memory_index(handle);
 	mgmem->refcnt		= 0;
 	mgmem->owner		= current->tgid;
-	mgmem->handle		= (unsigned long) mgmem;
+	mgmem->handle		= handle;
 	mgmem->map_address  = map_address;
 	mgmem->map_offset	= map_offset;
 	mgmem->map_length	= map_offset + karg.length;
@@ -343,8 +330,8 @@ strom_ioctl_map_gpu_memory(StromCmd__MapGpuMemory __user *uarg)
 								mgmem->map_address,
 								mgmem->map_length,
 								&mgmem->page_table,
-								strom_cleanup_mapped_gpu_memory,
-								mgmem);		/* as handle */
+								callback_release_mapped_gpu_memory,
+								mgmem);
 	if (rc)
 	{
 		prError("failed on nvidia_p2p_get_pages(addr=%p, len=%zu), rc=%d",
@@ -438,10 +425,9 @@ strom_ioctl_map_gpu_memory(StromCmd__MapGpuMemory __user *uarg)
 	}
 
 	/* attach this mapped_gpu_memory */
-	i = strom_mapped_gpu_memory_index(mgmem->handle);
-	mutex_lock(&strom_mgmem_mutex[i]);
-	list_add(&mgmem->chain, &strom_mgmem_slots[i]);
-	mutex_unlock(&strom_mgmem_mutex[i]);
+	spin_lock(&strom_mgmem_locks[mgmem->hindex]);
+	list_add(&mgmem->chain, &strom_mgmem_slots[mgmem->hindex]);
+	spin_unlock(&strom_mgmem_locks[mgmem->hindex]);
 
 	return 0;
 
@@ -471,14 +457,45 @@ static int
 strom_ioctl_unmap_gpu_memory(StromCmd__UnmapGpuMemory __user *uarg)
 {
 	StromCmd__UnmapGpuMemory karg;
-	int			rc;
+	mapped_gpu_memory  *mgmem;
+	spinlock_t		   *lock;
+	struct list_head   *slot;
+	int					i, rc;
 
 	if (copy_from_user(&karg, uarg, sizeof(karg)))
 		return -EFAULT;
 
-	rc = __strom_clenup_mapped_gpu_memory(karg.handle);
+	i = strom_mapped_gpu_memory_index(karg.handle);
+	lock = &strom_mgmem_locks[i];
+	slot = &strom_mgmem_slots[i];
 
-	return rc;
+	spin_lock(lock);
+	list_for_each_entry(mgmem, slot, chain)
+	{
+		/*
+		 * NOTE: I'm not 100% certain whether PID is the right check to
+		 * determine availability of the virtual address of GPU device.
+		 * So, this behavior may be changed in the later version.
+		 */
+		if (mgmem->handle == karg.handle &&
+			mgmem->owner  == current->tgid)
+		{
+			list_del(&mgmem->chain);
+			memset(&mgmem->chain, 0, sizeof(struct list_head));
+			spin_unlock(lock);
+
+			rc = __nvidia_p2p_put_pages(0, 0,
+										mgmem->map_address,
+										mgmem->page_table);
+			if (rc)
+				prError("failed on nvidia_p2p_put_pages: %d", rc);
+			return rc;
+		}
+	}
+	spin_unlock(lock);
+
+	prError("no mapped GPU memory found (handle: %lx)", karg.handle);
+	return -ENOENT;
 }
 
 /*
@@ -1469,7 +1486,7 @@ strom_proc_printf(strom_proc_entry *spent, const char *fmt, ...)
 		strom_proc_entry *spent_new;
 		size_t		length_new = 2 * spent->length;		
 
-		spent_new = __krealloc(spent, length_new, GFP_KERNEL);
+		spent_new = __krealloc(spent, length_new, GFP_ATOMIC);
 		kfree(spent);
 		spent = spent_new;
 		if (!spent)
@@ -1486,10 +1503,6 @@ static int
 strom_proc_open(struct inode *inode, struct file *filp)
 {
 	strom_proc_entry   *spent;
-	mapped_gpu_memory  *mgmem;
-	struct mutex	   *mutex;
-	struct list_head   *slot;
-	nvidia_p2p_page_table_t *page_table;
 	int					i, j;
 
 	spent = kmalloc(PAGE_SIZE, GFP_KERNEL);
@@ -1505,13 +1518,14 @@ strom_proc_open(struct inode *inode, struct file *filp)
 	/* for each mapping */
 	for (i=0; i < MAPPED_GPU_MEMORY_NSLOTS; i++)
 	{
-		mutex = &strom_mgmem_mutex[i];
-		slot  = &strom_mgmem_slots[i];
+		spinlock_t		   *lock = &strom_mgmem_locks[i];
+		struct list_head   *slot = &strom_mgmem_slots[i];
+		mapped_gpu_memory  *mgmem;
 
-		mutex_lock(mutex);
+		spin_lock(lock);
 		list_for_each_entry(mgmem, slot, chain)
 		{
-			page_table = mgmem->page_table;
+			nvidia_p2p_page_table_t *page_table = mgmem->page_table;
 
 			spent = strom_proc_printf(
 				spent,
@@ -1540,7 +1554,7 @@ strom_proc_open(struct inode *inode, struct file *filp)
 			}
 			spent = strom_proc_printf(spent, "\n");
 		}
-		mutex_unlock(mutex);
+		spin_unlock(lock);
 	}
 
 	if (!spent)
@@ -1673,7 +1687,7 @@ int	__init nvme_strom_init(void)
 	/* init strom_mgmem_mutex/slots */
 	for (i=0; i < MAPPED_GPU_MEMORY_NSLOTS; i++)
 	{
-		mutex_init(&strom_mgmem_mutex[i]);
+		spin_lock_init(&strom_mgmem_locks[i]);
 		INIT_LIST_HEAD(&strom_mgmem_slots[i]);
 	}
 
