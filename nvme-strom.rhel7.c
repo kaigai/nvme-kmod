@@ -175,7 +175,7 @@ nvme_submit_async_read_cmd(strom_dma_task *dtask,
 	cmd.rw.nsid			= cpu_to_le32(nvme_ns->ns_id);
 	cmd.rw.prp1			= cpu_to_le64(dma_addr);
 	cmd.rw.prp2			= cpu_to_le64(dma_addr); // right?
-	cmd.rw.metadata		= 0; //??? integrity check?;
+	cmd.rw.metadata		= 0;	/* XXX integrity check, if needed */
 	cmd.rw.slba			= cpu_to_le64(slba);
 	cmd.rw.length		= cpu_to_le16(nlb);
 	cmd.rw.control		= cpu_to_le16(control);

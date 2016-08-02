@@ -25,7 +25,6 @@ enum {
 struct StromCmd__CheckFile
 {
 	int				fdesc;		/* in: file descriptor to be checked */
-	size_t			falign;		/* out: required alignment size */
 };
 typedef struct StromCmd__CheckFile		StromCmd__CheckFile;
 

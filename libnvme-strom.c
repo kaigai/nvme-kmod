@@ -83,7 +83,7 @@ drivertest_debug(void)
 }
 
 static void
-drivertest_check_file(const char *filename, int fdesc, size_t *p_falign)
+drivertest_check_file(const char *filename, int fdesc)
 {
 	StromCmd__CheckFile uarg;
 	int		rc;
@@ -92,11 +92,10 @@ drivertest_check_file(const char *filename, int fdesc, size_t *p_falign)
 	uarg.fdesc = fdesc;
 
 	rc = nvme_strom_ioctl(STROM_IOCTL__CHECK_FILE, &uarg);
-	printf("STROM_IOCTL__CHECK_FILE('%s') --> %d (falign=%zu): %m\n",
-		   filename, uarg.falign, rc);
+	printf("STROM_IOCTL__CHECK_FILE('%s') --> %d: %m\n",
+		   filename, rc);
 	if (rc)
 		exit(rc);
-	*p_falign = uarg.falign;
 }
 
 static void
@@ -274,10 +273,10 @@ int main(int argc, char * const argv[])
 		fprintf(stderr, "failed on fstat(\"%s\"): %m\n", filename);
 		return 1;
 	}
+	filesize = (stbuf.st_size & ~(stbuf.st_blksize - 1));
 
 	/* is this file supported? */
-	drivertest_check_file(filename, fdesc, &falign);
-	filesize = (stbuf.st_size & ~(falign - 1));
+	drivertest_check_file(filename, fdesc);
 
 	/* if supported, try to alloc device memory */
 	drivertest_map_gpumem(filename, filesize,

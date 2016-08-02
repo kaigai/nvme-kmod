@@ -91,6 +91,22 @@ __ext4_get_block(struct inode *inode, sector_t offset,
 	return p_ext4_get_block(inode, offset, bh, create);
 }
 
+#if 1
+static struct module *mod_nvme_submit_io_cmd = NULL;
+static int (* p_nvme_submit_io_cmd)(struct nvme_dev *dev,
+									struct nvme_ns *ns,
+									struct nvme_command *cmd,
+									u32 *result);
+static inline int
+__nvme_submit_io_cmd(struct nvme_dev *dev, struct nvme_ns *ns,
+					 struct nvme_command *cmd, u32 *result)
+{
+	if (unlikely(!p_nvme_submit_io_cmd))
+		return -EINVAL;
+	return p_nvme_submit_io_cmd(dev, ns, cmd, result);
+}
+#endif
+
 /* xfs_get_blocks */
 static struct module *mod_xfs_get_blocks = NULL;
 static int (* p_xfs_get_blocks)(
@@ -221,6 +237,7 @@ strom_init_extra_symbols(void)
 	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvidia_p2p_get_pages);
 	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvidia_p2p_put_pages);
 	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvidia_p2p_free_page_table);
+	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvme_submit_io_cmd);
 
 	/* notifier to get optional extra symbols */
 	rc = register_module_notifier(&nvme_strom_nb);
