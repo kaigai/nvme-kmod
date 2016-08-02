@@ -112,7 +112,8 @@ __xfs_get_blocks(struct inode *inode, sector_t offset,
 static inline int
 __strom_lookup_extra_symbol(const char *symbol_name,
 							void **symbol_addr,
-							struct module **symbol_mod)
+							struct module **symbol_mod,
+							bool is_optional)
 {
 	unsigned long	addr;
 	struct module  *mod;
@@ -120,7 +121,9 @@ __strom_lookup_extra_symbol(const char *symbol_name,
 	addr = kallsyms_lookup_name(symbol_name);
 	if (!addr)
 	{
-		prError("could not solve the kernel symbol: %s", symbol_name);
+		prError("could not solve %s kernel symbol: %s",
+				is_optional ? "an optional" : "a required",
+				symbol_name);
 		return -ENOENT;
 	}
 
@@ -157,7 +160,8 @@ strom_update_extra_symbols(struct notifier_block *nb,
 		if (!p_##SYMBOL)										\
 			__strom_lookup_extra_symbol(#SYMBOL,				\
 										(void **)&p_##SYMBOL,	\
-										&mod_##SYMBOL);			\
+										&mod_##SYMBOL,			\
+										true);					\
 	} while(0)
 
 	/* ext4 */
@@ -207,7 +211,8 @@ strom_init_extra_symbols(void)
 	do {														\
 		rc = __strom_lookup_extra_symbol(#SYMBOL,				\
 										 (void **)&p_##SYMBOL,	\
-										 &mod_##SYMBOL);		\
+										 &mod_##SYMBOL,			\
+										 false);				\
 		if (rc)													\
 			goto cleanup;										\
 	} while(0)

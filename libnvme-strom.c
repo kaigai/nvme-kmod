@@ -176,6 +176,17 @@ drivertest_print_gpumem(unsigned long handle, unsigned int num_pages)
 }
 
 static void
+drivertest_unmap_gpumem(unsigned long handle)
+{
+	StromCmd__UnmapGpuMemory uarg;
+	int		retval;
+
+	uarg.handle = handle;
+	retval = nvme_strom_ioctl(STROM_IOCTL__UNMAP_GPU_MEMORY, &uarg);
+	printf("STROM_IOCTL__UNMAP_GPU_MEMORY(handle=%lx) = %d\n", handle, retval);
+}
+
+static void
 drivertest_dma_gpumem(const char *filename, int fdesc, size_t file_size,
 					  CUdeviceptr devptr, unsigned long handle)
 {
