@@ -69,12 +69,13 @@ nvme_callback_async_read_cmd(struct nvme_queue *nvmeq, void *ctx,
 {
 	strom_dma_request  *dma_req = (strom_dma_request *) ctx;
 	int					dma_status = le16_to_cpup(&cqe->status) >> 1;
-//	u32					dma_result = le32_to_cpup(&cqe->result);
+	u32					dma_result = le32_to_cpup(&cqe->result);
 
 	/*
 	 * FIXME: dma_status is one of NVME_SC_* (like NVME_SC_SUCCESS)
 	 * We have to translate it to host understandable error code
 	 */
+	prDebug("DMA Req Completed status=%d result=%u", dma_status, dma_result);
 
 	/* release resources and wake up waiter */
 	blk_mq_free_request(dma_req->req);
