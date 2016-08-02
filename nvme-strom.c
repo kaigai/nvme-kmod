@@ -946,48 +946,96 @@ submit_ram2gpu_memcpy(strom_dma_task *dtask)
 #error "no platform specific NVMe-SSD routines"
 #endif
 
+/* */
+static struct nvme_iod *
+nvme_alloc_iod(unsigned int nseg, size_t nbytes,
+			   struct nvme_dev *dev, gfp_t gfp)
+{
+	struct nvme_iod *iod;
+	unsigned int	nprps;
+	unsigned int	npages;
+
+	/*
+	 * Will slightly overestimate the number of pages needed.  This is OK
+	 * as it only leads to a small amount of wasted memory for the lifetime of
+	 * the I/O.
+	 */
+	nprps = DIV_ROUND_UP(nbytes + dev->page_size, dev->page_size);
+	npages = DIV_ROUND_UP(8 * nprps, dev->page_size - 8);
+
+	iod = kmalloc(sizeof(struct nvme_iod) +
+				  sizeof(__le64) * npages +
+				  sizeof(struct scatterlist) * nseg, gfp);
+	if (iod)
+	{
+		iod->offset = offsetof(struct nvme_iod, sg[nseg]);
+		iod->npages = -1;
+		iod->length = nbytes;
+		iod->nents = 0;
+		iod->first_dma = 0ULL;
+	}
+	return iod;
+}
+
+
 static int
 submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 {
 	mapped_gpu_memory  *mgmem = dtask->mgmem;
 	nvidia_p2p_page_table_t *page_table = mgmem->page_table;
-	size_t				length;
-	dma_addr_t			dest_addr;
-	u64					slba;
-	int					nlb;
-	int					i, retval = 0;
+	struct nvme_ns	   *nvme_ns = dtask->nvme_ns;
+	struct nvme_dev	   *nvme_dev = nvme_ns->dev;
+	struct nvme_iod	   *iod;
+	struct scatterlist *sg;
+	size_t				offset;
+	size_t				remained;
+	dma_addr_t			base_addr;
+	int					i, base;
+	int					retval;
 
-	Assert(dtask->dma_offset == 0);
-	Assert((dtask->dma_length & (dtask->blocksz - 1)) == 0);
-	Assert((dtask->dma_length >> dtask->blocksz_shift) == dtask->nr_blocks);
+	if (!dtask->dma_length || dtask->dma_length > INT_MAX - PAGE_SIZE)
+		return -EINVAL;
 
-	while (dtask->dma_length > 0)
+	iod = nvme_alloc_iod(page_table->entries,
+						 dtask->dma_length,
+						 nvme_dev,
+						 GFP_KERNEL);
+	if (!iod)
+		return -ENOMEM;
+
+	sg = iod->sg;
+	sg_init_table(sg, page_table->entries);
+
+    base = (dtask->dest_offset >> mgmem->gpu_page_shift);
+	offset = (dtask->dest_offset & (mgmem->gpu_page_sz - 1));
+	remained = dtask->dma_length;
+	for (i=0; i < page_table->entries; i++)
 	{
-		length = ((dtask->dest_offset + mgmem->gpu_page_sz)
-				  & ~(mgmem->gpu_page_sz - 1)) - dtask->dest_offset;
-		length = Min(length, dtask->dma_length);
-		Assert((length & (dtask->blocksz - 1)) == 0);
-
-		i = dtask->dest_offset >> mgmem->gpu_page_shift;
-		Assert(i < page_table->entries);
-		dest_addr = (page_table->pages[i]->physical_address +
-					 (dtask->dest_offset & (mgmem->gpu_page_sz - 1)));
-		slba = dtask->src_block;
-		nlb = length >> dtask->blocksz_shift;
-		prDebug("Submit READ slba=%zu nlb=%d --> %p / %p",
-				(size_t)slba, nlb, (void *)hoge_addr, (void *)dest_addr);
-		retval = nvme_submit_async_read_cmd(dtask, dest_addr, slba, nlb);
-		if (retval)
+		if (!remained)
 			break;
-		/* make the pointers advanced */
-		dtask->dma_length -= length;
-		dtask->dest_offset += length;
-		dtask->src_block += nlb;
-		dtask->nr_blocks -= nlb;
+
+		base_addr = page_table->pages[base + i]->physical_address;
+		sg[i].page_link = 0;
+		sg[i].dma_address = base_addr + offset;
+		sg[i].length = Min(remained, mgmem->gpu_page_sz - offset);
+		sg[i].dma_length = sg[i].length;
+		sg[i].offset = 0;
+
+		offset = 0;
+		remained -= sg[i].length;
 	}
-	/* reset pending blocks */
-	dtask->src_block = ~0UL;
-	dtask->nr_blocks = 0;
+
+	if (remained)
+	{
+		__nvme_free_iod(nvme_dev, iod);
+		return -EINVAL;
+	}
+	sg_mark_end(&sg[i]);
+	iod->nents = i;
+
+	retval = nvme_submit_async_read_cmd(dtask, iod);
+	if (retval)
+		__nvme_free_iod(nvme_dev, iod);
 
 	return retval;
 }

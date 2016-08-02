@@ -30,8 +30,7 @@ __nvidia_p2p_get_pages(uint64_t p2p_token,
 					   void (*free_callback)(void *data),
 					   void *data)
 {
-	if (unlikely(!p_nvidia_p2p_get_pages))
-		return -EINVAL;
+	BUG_ON(!p_nvidia_p2p_get_pages);
 	return p_nvidia_p2p_get_pages(p2p_token,
 								  va_space,
 								  virtual_address,
@@ -55,8 +54,7 @@ __nvidia_p2p_put_pages(uint64_t p2p_token,
 					   uint64_t virtual_address,
 					   struct nvidia_p2p_page_table *page_table)
 {
-	if (unlikely(!p_nvidia_p2p_put_pages))
-		return -EINVAL;
+	BUG_ON(!p_nvidia_p2p_put_pages);
 	return p_nvidia_p2p_put_pages(p2p_token,
 								  va_space,
 								  virtual_address,
@@ -71,8 +69,7 @@ static int (*p_nvidia_p2p_free_page_table)(
 static inline int
 __nvidia_p2p_free_page_table(struct nvidia_p2p_page_table *page_table)
 {
-	if (unlikely(!p_nvidia_p2p_free_page_table))
-		return -EINVAL;
+	BUG_ON(!p_nvidia_p2p_free_page_table);
 	return p_nvidia_p2p_free_page_table(page_table);
 }
 
@@ -86,26 +83,9 @@ static inline int
 __ext4_get_block(struct inode *inode, sector_t offset,
 				 struct buffer_head *bh, int create)
 {
-	if (unlikely(!p_ext4_get_block))
-		return -EINVAL;
+	BUG_ON(!p_ext4_get_block);
 	return p_ext4_get_block(inode, offset, bh, create);
 }
-
-#if 1
-static struct module *mod_nvme_submit_io_cmd = NULL;
-static int (* p_nvme_submit_io_cmd)(struct nvme_dev *dev,
-									struct nvme_ns *ns,
-									struct nvme_command *cmd,
-									u32 *result);
-static inline int
-__nvme_submit_io_cmd(struct nvme_dev *dev, struct nvme_ns *ns,
-					 struct nvme_command *cmd, u32 *result)
-{
-	if (unlikely(!p_nvme_submit_io_cmd))
-		return -EINVAL;
-	return p_nvme_submit_io_cmd(dev, ns, cmd, result);
-}
-#endif
 
 /* xfs_get_blocks */
 static struct module *mod_xfs_get_blocks = NULL;
@@ -117,10 +97,52 @@ static inline int
 __xfs_get_blocks(struct inode *inode, sector_t offset,
 				 struct buffer_head *bh, int create)
 {
-	if (unlikely(!p_xfs_get_blocks))
-		return -EINVAL;
+	BUG_ON(!p_xfs_get_blocks);
 	return p_xfs_get_blocks(inode, offset, bh, create);
 }
+
+/* nvme_submit_io_cmd */
+#if 1
+static struct module *mod_nvme_submit_io_cmd = NULL;
+static int (* p_nvme_submit_io_cmd)(struct nvme_dev *dev,
+									struct nvme_ns *ns,
+									struct nvme_command *cmd,
+									u32 *result) = NULL;
+static inline int
+__nvme_submit_io_cmd(struct nvme_dev *dev, struct nvme_ns *ns,
+					 struct nvme_command *cmd, u32 *result)
+{
+	BUG_ON(!p_nvme_submit_io_cmd);
+	return p_nvme_submit_io_cmd(dev, ns, cmd, result);
+}
+#endif
+
+/* nvme_setup_prps */
+static struct module *mod_nvme_setup_prps = NULL;
+static int (* p_nvme_setup_prps)(struct nvme_dev *dev,
+								 struct nvme_iod *iod,
+								 int total_len, gfp_t gfp) ;
+static inline int
+__nvme_setup_prps(struct nvme_dev *dev,
+				  struct nvme_iod *iod,
+				  int total_len, gfp_t gfp)
+{
+	BUG_ON(!p_nvme_setup_prps);
+	return p_nvme_setup_prps(dev, iod, total_len, gfp);
+}
+
+/* nvme_free_iod */
+#if 1
+static struct module *mod_nvme_free_iod = NULL;
+static void (* p_nvme_free_iod)(struct nvme_dev *dev,
+								struct nvme_iod *iod) = NULL;
+static inline void
+__nvme_free_iod(struct nvme_dev *dev, struct nvme_iod *iod)
+{
+	BUG_ON(!p_nvme_free_iod);
+	p_nvme_free_iod(dev, iod);
+}
+#endif
 
 /*
  * __strom_lookup_extra_symbol - lookup extra symbol and grab module if any
@@ -202,6 +224,10 @@ strom_put_all_extra_modules(void)
 	module_put(mod_nvidia_p2p_free_page_table);
 	module_put(mod_ext4_get_block);
 	module_put(mod_xfs_get_blocks);
+	/* nvme */
+	module_put(mod_nvme_submit_io_cmd);
+	module_put(mod_nvme_setup_prps);
+	module_put(mod_nvme_free_iod);
 }
 
 /*
@@ -237,7 +263,9 @@ strom_init_extra_symbols(void)
 	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvidia_p2p_get_pages);
 	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvidia_p2p_put_pages);
 	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvidia_p2p_free_page_table);
+	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvme_free_iod);
 	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvme_submit_io_cmd);
+	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvme_setup_prps);
 
 	/* notifier to get optional extra symbols */
 	rc = register_module_notifier(&nvme_strom_nb);

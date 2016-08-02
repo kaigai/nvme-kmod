@@ -225,8 +225,6 @@ drivertest_dma_gpumem(const char *filename, int fdesc, size_t file_size,
 	printf("STROM_IOCTL__MEMCPY_SSD2GPU(%zu bytes) --> %d: %m\n",
 		   file_size, retval);
 
-	sleep(2);
-
 	/* GPU RAM -> dst_buffer */
 	rc = cuMemcpyDtoH(dst_buffer, devptr, file_size);
 	cuda_exit_on_error(rc, "cuMemcpyDtoH");
@@ -234,7 +232,7 @@ drivertest_dma_gpumem(const char *filename, int fdesc, size_t file_size,
 	/* compare results */
 	retval = memcmp(src_buffer, dst_buffer, file_size);
 	printf("memcmp(src, dst, %zu) --> %d\n", file_size, retval);
-//	write(0, dst_buffer, file_size);
+	retval = write(0, dst_buffer, file_size);
 }
 
 /*

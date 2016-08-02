@@ -133,8 +133,7 @@ nvme_set_info(struct nvme_cmd_info *cmd, void *ctx, nvme_completion_fn handler)
  * thus, strom_memcpy_ssd2gpu_wait() allows synchronization of DMA completion.
  */
 static int
-nvme_submit_async_read_cmd(strom_dma_task *dtask,
-						   uint64_t dma_addr, uint64_t slba, u16 nlb)
+nvme_submit_async_read_cmd(strom_dma_task *dtask, struct nvme_iod *iod)
 {
 	struct nvme_ns		   *nvme_ns = dtask->nvme_ns;
 	struct request		   *req;
@@ -168,16 +167,18 @@ nvme_submit_async_read_cmd(strom_dma_task *dtask,
 	if (req->cmd_flags & REQ_RAHEAD)
 		dsmgmt |= NVME_RW_DSM_FREQ_PREFETCH;
 
+	__nvme_setup_prps(nvme_ns->dev, iod, dtask->dma_length, GFP_KERNEL);
+
 	memset(&cmd, 0, sizeof(struct nvme_command));
 	cmd.rw.opcode		= nvme_cmd_read;
 	cmd.rw.flags		= 0;	/* we use PRPs, rather than SGL */
 	cmd.rw.command_id	= req->tag;
 	cmd.rw.nsid			= cpu_to_le32(nvme_ns->ns_id);
-	cmd.rw.prp1			= cpu_to_le64(dma_addr);
-	cmd.rw.prp2			= cpu_to_le64(dma_addr); // right?
+	cmd.rw.prp1			= cpu_to_le64(sg_dma_address(iod->sg));
+	cmd.rw.prp2			= cpu_to_le64(iod->first_dma);
 	cmd.rw.metadata		= 0;	/* XXX integrity check, if needed */
-	cmd.rw.slba			= cpu_to_le64(slba);
-	cmd.rw.length		= cpu_to_le16(nlb);
+	cmd.rw.slba			= cpu_to_le64(8 * dtask->src_block);
+	cmd.rw.length		= cpu_to_le16(dtask->nr_blocks - 1);
 	cmd.rw.control		= cpu_to_le16(control);
 	cmd.rw.dsmgmt		= cpu_to_le32(dsmgmt);
 	/*
