@@ -164,7 +164,7 @@ nvme_submit_async_read_cmd(strom_dma_task *dtask, struct nvme_iod *iod)
 	prp_len = __nvme_setup_prps(nvme_ns->dev, iod, length, GFP_KERNEL);
 	if (prp_len != length)
 		return -ENOMEM;
-#if 1
+#if 0
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.rw.opcode		= nvme_cmd_read;
 	cmd.rw.flags		= 0;
