@@ -178,7 +178,7 @@ nvme_submit_async_read_cmd(strom_dma_task *dtask, struct nvme_iod *iod)
 
 	retval = __nvme_submit_io_cmd(nvme_ns->dev, nvme_ns, &cmd, NULL);
 
-	nvme_free_iod(nvme_ns->dev, iod);
+	__nvme_free_iod(nvme_ns->dev, iod);
 #else
 	/* submit an asynchronous command */
 	dma_req = kzalloc(sizeof(strom_dma_request), GFP_KERNEL);
