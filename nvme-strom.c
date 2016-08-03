@@ -954,7 +954,7 @@ submit_ram2gpu_memcpy(strom_dma_task *dtask)
 
 /* */
 static struct nvme_iod *
-nvme_alloc_iod(unsigned int nseg, size_t nbytes,
+nvme_alloc_iod(unsigned int nsegs, size_t nbytes,
 			   struct nvme_dev *dev, gfp_t gfp)
 {
 	struct nvme_iod *iod;
@@ -969,13 +969,13 @@ nvme_alloc_iod(unsigned int nseg, size_t nbytes,
 	nprps = DIV_ROUND_UP(nbytes + dev->page_size, dev->page_size);
 	npages = DIV_ROUND_UP(8 * nprps, dev->page_size - 8);
 
-	iod = kmalloc(sizeof(struct nvme_iod) +
-				  sizeof(__le64) * npages +
-				  sizeof(struct scatterlist) * nseg, gfp);
+	iod = kmalloc(offsetof(struct nvme_iod, sg[nsegs]) +
+				  sizeof(__le64) * npages, gfp);
 	if (iod)
 	{
-		iod->offset = offsetof(struct nvme_iod, sg[nseg]);
+		iod->private = 0;
 		iod->npages = -1;
+		iod->offset = offsetof(struct nvme_iod, sg[nsegs]);
 		iod->length = nbytes;
 		iod->nents = 0;
 		iod->first_dma = 0ULL;
@@ -999,7 +999,7 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 	int					i, base;
 	int					retval;
 
-	total_nbytes = (dtask->nr_blocks << dtask->blocksz);
+	total_nbytes = (dtask->nr_blocks << dtask->blocksz_shift);
 	if (!total_nbytes || total_nbytes > INT_MAX - PAGE_SIZE)
 		return -EINVAL;
 
@@ -1015,6 +1015,8 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 
 	base = (dtask->dest_offset >> mgmem->gpu_page_shift);
 	offset = (dtask->dest_offset & (mgmem->gpu_page_sz - 1));
+	prDebug("base=%zu offset=%zu dest_ofs=%zu total_nbytes=%zu",
+			base, offset, dtask->dest_offset, total_nbytes);
 	dtask->dest_offset += total_nbytes;
 	for (i=0; i < page_table->entries; i++)
 	{
@@ -1037,7 +1039,7 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 		__nvme_free_iod(nvme_dev, iod);
 		return -EINVAL;
 	}
-	sg_mark_end(&sg[i]);
+	sg_mark_end(&sg[i-1]);
 	iod->nents = i;
 
 	retval = nvme_submit_async_read_cmd(dtask, iod);

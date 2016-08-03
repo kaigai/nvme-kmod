@@ -235,7 +235,34 @@ drivertest_dma_gpumem(const char *filename, int fdesc, size_t file_size,
 	/* compare results */
 	retval = memcmp(src_buffer, dst_buffer, file_size);
 	printf("memcmp(src, dst, %zu) --> %d\n", file_size, retval);
-	retval = write(0, dst_buffer, file_size);
+
+#if 1
+	/* dump destination buffer */
+	{
+		size_t	i;
+
+		for (i=0; i < file_size; i++)
+		{
+			if (i % 32 == 0)
+				printf("%04x: ", i);
+			if (i % 32 == 16)
+				putchar(' ');
+			printf("%02x%c", ((unsigned char *)dst_buffer)[i], (i % 32 == 31 ? '\n' : ' '));
+		}
+	}
+#endif
+#if 0
+	/* dump non-zero */
+	{
+		size_t	i;
+
+		for (i=0; i < file_size; i++)
+		{
+			if (((char *)dst_buffer)[i])
+				printf("%08x: %02x\n", i, ((char *)dst_buffer)[i]);
+		}
+	}
+#endif
 }
 
 /*

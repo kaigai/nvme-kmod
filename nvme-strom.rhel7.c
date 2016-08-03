@@ -159,8 +159,21 @@ nvme_submit_async_read_cmd(strom_dma_task *dtask, struct nvme_iod *iod)
 		return -EINVAL;
 	slba = dtask->src_block << (dtask->blocksz_shift -
 								nvme_ns->lba_shift);
-
 	/* setup scatter-gather list */
+	{
+		int		i;
+
+		prDebug("iod %p {private=%lu npages=%d offset=%d nents=%d length=%d}",
+				iod, iod->private, iod->npages, iod->offset,
+				iod->nents, iod->length);
+		for (i=0; i < iod->nents; i++)
+		{
+			struct scatterlist *sg = &iod->sg[i];
+
+			prDebug("sg[%d] {page_link=%ld offset=%u length=%u daddr=%p}",
+					i, sg->page_link, sg->offset, sg->length, (void *)sg->dma_address);
+		}
+	}
 	prp_len = __nvme_setup_prps(nvme_ns->dev, iod, length, GFP_KERNEL);
 	if (prp_len != length)
 		return -ENOMEM;
@@ -176,9 +189,13 @@ nvme_submit_async_read_cmd(strom_dma_task *dtask, struct nvme_iod *iod)
 	cmd.rw.control		= cpu_to_le16(control);
 	cmd.rw.dsmgmt		= cpu_to_le32(dsmgmt);
 
+	prDebug("cmd {prp1=%lx prp2=%lx slba=%lu len=%d}", cmd.rw.prp1, cmd.rw.prp2, cmd.rw.slba, cmd.rw.length);
+
 	retval = __nvme_submit_io_cmd(nvme_ns->dev, nvme_ns, &cmd, NULL);
 
-	nvme_free_iod(nvme_ns->dev, iod);
+	prDebug("__nvme_submit_io_cmd = %d", retval);
+
+	__nvme_free_iod(nvme_ns->dev, iod);
 #else
 	/* submit an asynchronous command */
 	dma_req = kzalloc(sizeof(strom_dma_request), GFP_KERNEL);
