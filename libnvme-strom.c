@@ -123,6 +123,9 @@ drivertest_map_gpumem(const char *filename, size_t file_size,
 	rc = cuMemAlloc(&cuda_devptr, file_size);
 	cuda_exit_on_error(rc, "cuMemAlloc");
 
+	rc = cuMemsetD32(cuda_devptr, 0x41424344, file_size / sizeof(int));
+	cuda_exit_on_error(rc, "cuMemsetD32");
+
 	memset(&uarg, 0, sizeof(StromCmd__MapGpuMemory));
 	uarg.vaddress = cuda_devptr;
 	uarg.length = file_size;

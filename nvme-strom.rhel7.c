@@ -14,6 +14,7 @@
 struct strom_dma_request {
 	strom_dma_task	   *dtask;
 	struct request	   *req;
+	struct nvme_iod	   *iod;
 };
 typedef struct strom_dma_request	strom_dma_request;
 
@@ -78,6 +79,7 @@ nvme_callback_async_read_cmd(struct nvme_queue *nvmeq, void *ctx,
 	prDebug("DMA Req Completed status=%d result=%u", dma_status, dma_result);
 
 	/* release resources and wake up waiter */
+	__nvme_free_iod(nvmeq->dev, dma_req->iod);
 	blk_mq_free_request(dma_req->req);
 	strom_put_dma_task(dma_req->dtask, dma_status);
 	kfree(dma_req);
@@ -140,9 +142,45 @@ nvme_submit_async_read_cmd(strom_dma_task *dtask, struct nvme_iod *iod)
 	struct nvme_cmd_info   *cmd_rq;
 	struct nvme_command		cmd;
 	strom_dma_request	   *dma_req;
+	size_t					length;
+	int						prp_len;
 	u16						control = 0;
 	u32						dsmgmt = 0;
+	u32						nblocks;
+	u64						slba;
+	int						retval = 0;
 
+	Assert(dtask->blocksz_shift >= nvme_ns->lba_shift);
+	/* setup scatter-gather list */
+	length  = (dtask->nr_blocks << dtask->blocksz_shift);
+	nblocks = (dtask->nr_blocks << (dtask->blocksz_shift -
+									nvme_ns->lba_shift)) - 1;
+	if (nblocks > 0xffff)
+		return -EINVAL;
+	slba = dtask->src_block << (dtask->blocksz_shift -
+								nvme_ns->lba_shift);
+
+	/* setup scatter-gather list */
+	prp_len = __nvme_setup_prps(nvme_ns->dev, iod, length, GFP_KERNEL);
+	if (prp_len != length)
+		return -ENOMEM;
+#if 1
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.rw.opcode		= nvme_cmd_read;
+	cmd.rw.flags		= 0;
+	cmd.rw.nsid			= cpu_to_le32(nvme_ns->ns_id);
+	cmd.rw.prp1			= cpu_to_le64(sg_dma_address(iod->sg));
+	cmd.rw.prp2			= cpu_to_le64(iod->first_dma);
+	cmd.rw.slba			= cpu_to_le64(slba);
+	cmd.rw.length		= cpu_to_le16(nblocks);
+	cmd.rw.control		= cpu_to_le16(control);
+	cmd.rw.dsmgmt		= cpu_to_le32(dsmgmt);
+
+	retval = __nvme_submit_io_cmd(nvme_ns->dev, nvme_ns, &cmd, NULL);
+
+	nvme_free_iod(nvme_ns->dev, iod);
+#else
+	/* submit an asynchronous command */
 	dma_req = kzalloc(sizeof(strom_dma_request), GFP_KERNEL);
 	if (!dma_req)
 		return -ENOMEM;
@@ -157,6 +195,7 @@ nvme_submit_async_read_cmd(strom_dma_task *dtask, struct nvme_iod *iod)
 		return PTR_ERR(req);
 	}
 	dma_req->req = req;
+	dma_req->iod = iod;
 	dma_req->dtask = strom_get_dma_task(dtask);
 
 	/* setup READ command */
@@ -167,8 +206,6 @@ nvme_submit_async_read_cmd(strom_dma_task *dtask, struct nvme_iod *iod)
 	if (req->cmd_flags & REQ_RAHEAD)
 		dsmgmt |= NVME_RW_DSM_FREQ_PREFETCH;
 
-	__nvme_setup_prps(nvme_ns->dev, iod, dtask->dma_length, GFP_KERNEL);
-
 	memset(&cmd, 0, sizeof(struct nvme_command));
 	cmd.rw.opcode		= nvme_cmd_read;
 	cmd.rw.flags		= 0;	/* we use PRPs, rather than SGL */
@@ -177,8 +214,8 @@ nvme_submit_async_read_cmd(strom_dma_task *dtask, struct nvme_iod *iod)
 	cmd.rw.prp1			= cpu_to_le64(sg_dma_address(iod->sg));
 	cmd.rw.prp2			= cpu_to_le64(iod->first_dma);
 	cmd.rw.metadata		= 0;	/* XXX integrity check, if needed */
-	cmd.rw.slba			= cpu_to_le64(8 * dtask->src_block);
-	cmd.rw.length		= cpu_to_le16(dtask->nr_blocks - 1);
+	cmd.rw.slba			= cpu_to_le64(slba);
+	cmd.rw.length		= cpu_to_le16(nblocks);
 	cmd.rw.control		= cpu_to_le16(control);
 	cmd.rw.dsmgmt		= cpu_to_le32(dsmgmt);
 	/*
@@ -189,6 +226,6 @@ nvme_submit_async_read_cmd(strom_dma_task *dtask, struct nvme_iod *iod)
 	cmd_rq = blk_mq_rq_to_pdu(req);
 	nvme_set_info(cmd_rq, dma_req, nvme_callback_async_read_cmd);
 	nvme_submit_cmd(cmd_rq->nvmeq, &cmd);
-
-	return 0;
+#endif
+	return retval;
 }
