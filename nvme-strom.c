@@ -765,6 +765,8 @@ struct strom_dma_task
 	struct file		   *filp;		/* source file, if any */
 	size_t				blocksz;	/* blocksize of this partition */
 	int					blocksz_shift;	/* log2 of 'blocksz' */
+	sector_t			start_sect;	/* first sector of the source partition */
+	sector_t			nr_sects;	/* number of sectors of the partition */
 	/* Contiguous SSD blocks */
 	sector_t			src_block;	/* head of the source blocks */
 	unsigned int		nr_blocks;	/* # of the contigunous source blocks */
@@ -1380,13 +1382,14 @@ strom_memcpy_ssd2gpu_async(struct file *ioctl_filp,
 						   unsigned long *p_dma_task_id)
 {
 	StromCmd__MemCpySsdToGpu karg;
-	mapped_gpu_memory  *mgmem;
-	strom_dma_task	   *dtask;
-	struct file		   *filp;
-	struct super_block *i_sb;
-	struct nvme_ns	   *nvme_ns;
-	unsigned long		dma_task_id;
-	long				retval = 0;
+	mapped_gpu_memory	   *mgmem;
+	strom_dma_task		   *dtask;
+	struct file			   *filp;
+	struct super_block	   *i_sb;
+	struct block_device	   *s_bdev;
+	struct nvme_ns		   *nvme_ns;
+	unsigned long			dma_task_id;
+	long					retval = 0;
 
 	prInfo("begin strom_memcpy_ssd2gpu_async");
 	if (copy_from_user(&karg, uarg,
@@ -1405,6 +1408,7 @@ strom_memcpy_ssd2gpu_async(struct file *ioctl_filp,
 	if (retval < 0)
 		goto error_1;
 	i_sb = filp->f_inode->i_sb;
+	s_bdev = i_sb->s_bdev;
 
 	/* get destination GPU memory */
 	mgmem = strom_get_mapped_gpu_memory(karg.handle);
@@ -1432,6 +1436,8 @@ strom_memcpy_ssd2gpu_async(struct file *ioctl_filp,
 	dtask->blocksz = i_sb->s_blocksize;
 	dtask->blocksz_shift = i_sb->s_blocksize_bits;
 	Assert(dtask->blocksz == (1UL << dtask->blocksz_shift));
+	dtask->start_sect = s_bdev->bd_part->start_sect;
+	dtask->nr_sects = s_bdev->bd_part->nr_sects;
 	dtask->nr_blocks = 0;
 	dtask->nr_pages = 0;
 	dtask->head_offset = 0;
