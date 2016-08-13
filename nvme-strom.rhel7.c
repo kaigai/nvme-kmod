@@ -157,8 +157,14 @@ nvme_submit_async_read_cmd(strom_dma_task *dtask, struct nvme_iod *iod)
 									nvme_ns->lba_shift)) - 1;
 	if (nblocks > 0xffff)
 		return -EINVAL;
+	prDebug("src_block=%zu start_sect=%zu nblocks=%u",
+			(size_t)dtask->src_block,
+			(size_t)dtask->start_sect,
+			nblocks);
 	slba = dtask->src_block << (dtask->blocksz_shift -
 								nvme_ns->lba_shift);
+	slba += dtask->start_sect;
+
 	/* setup scatter-gather list */
 	{
 		int		i;
@@ -195,7 +201,7 @@ nvme_submit_async_read_cmd(strom_dma_task *dtask, struct nvme_iod *iod)
 
 	prDebug("__nvme_submit_io_cmd = %d", retval);
 
-	__nvme_free_iod(nvme_ns->dev, iod);
+//	__nvme_free_iod(nvme_ns->dev, iod);
 #else
 	/* submit an asynchronous command */
 	dma_req = kzalloc(sizeof(strom_dma_request), GFP_KERNEL);

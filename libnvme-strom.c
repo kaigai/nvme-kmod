@@ -235,8 +235,10 @@ drivertest_dma_gpumem(const char *filename, int fdesc, size_t file_size,
 	/* compare results */
 	retval = memcmp(src_buffer, dst_buffer, file_size);
 	printf("memcmp(src, dst, %zu) --> %d\n", file_size, retval);
-
-#if 1
+#if 0
+	write(fileno(stdout), dst_buffer, file_size);
+#endif
+#if 0
 	/* dump destination buffer */
 	{
 		size_t	i;

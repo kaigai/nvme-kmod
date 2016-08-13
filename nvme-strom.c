@@ -955,6 +955,7 @@ submit_ram2gpu_memcpy(strom_dma_task *dtask)
 #error "no platform specific NVMe-SSD routines"
 #endif
 
+#if 1
 /* */
 static struct nvme_iod *
 nvme_alloc_iod(unsigned int nsegs, size_t nbytes,
@@ -985,7 +986,7 @@ nvme_alloc_iod(unsigned int nsegs, size_t nbytes,
 	}
 	return iod;
 }
-
+#endif
 
 static int
 submit_ssd2gpu_memcpy(strom_dma_task *dtask)
