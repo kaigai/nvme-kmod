@@ -138,10 +138,10 @@ static int
 nvme_submit_async_read_cmd(strom_dma_task *dtask, struct nvme_iod *iod)
 {
 	struct nvme_ns		   *nvme_ns = dtask->nvme_ns;
-	struct request		   *req;
-	struct nvme_cmd_info   *cmd_rq;
+	struct request		   *req			__attribute__((unused));
+	struct nvme_cmd_info   *cmd_rq		__attribute__((unused));
 	struct nvme_command		cmd;
-	strom_dma_request	   *dma_req;
+	strom_dma_request	   *dma_req		__attribute__((unused));
 	size_t					length;
 	int						prp_len;
 	u16						control = 0;
@@ -149,6 +149,7 @@ nvme_submit_async_read_cmd(strom_dma_task *dtask, struct nvme_iod *iod)
 	u32						nblocks;
 	u64						slba;
 	int						retval = 0;
+	u32						hoge		__attribute__((unused));
 
 	Assert(dtask->blocksz_shift >= nvme_ns->lba_shift);
 	/* setup scatter-gather list */
@@ -166,6 +167,7 @@ nvme_submit_async_read_cmd(strom_dma_task *dtask, struct nvme_iod *iod)
 	slba += dtask->start_sect;
 
 	/* setup scatter-gather list */
+	if (verbose)
 	{
 		int		i;
 
@@ -183,26 +185,7 @@ nvme_submit_async_read_cmd(strom_dma_task *dtask, struct nvme_iod *iod)
 	prp_len = __nvme_setup_prps(nvme_ns->dev, iod, length, GFP_KERNEL);
 	if (prp_len != length)
 		return -ENOMEM;
-#if 1
-	memset(&cmd, 0, sizeof(cmd));
-	cmd.rw.opcode		= nvme_cmd_read;
-	cmd.rw.flags		= 0;
-	cmd.rw.nsid			= cpu_to_le32(nvme_ns->ns_id);
-	cmd.rw.prp1			= cpu_to_le64(sg_dma_address(iod->sg));
-	cmd.rw.prp2			= cpu_to_le64(iod->first_dma);
-	cmd.rw.slba			= cpu_to_le64(slba);
-	cmd.rw.length		= cpu_to_le16(nblocks);
-	cmd.rw.control		= cpu_to_le16(control);
-	cmd.rw.dsmgmt		= cpu_to_le32(dsmgmt);
 
-	prDebug("cmd {prp1=%lx prp2=%lx slba=%lu len=%d}", cmd.rw.prp1, cmd.rw.prp2, cmd.rw.slba, cmd.rw.length);
-
-	retval = __nvme_submit_io_cmd(nvme_ns->dev, nvme_ns, &cmd, NULL);
-
-	prDebug("__nvme_submit_io_cmd = %d", retval);
-
-//	__nvme_free_iod(nvme_ns->dev, iod);
-#else
 	/* submit an asynchronous command */
 	dma_req = kzalloc(sizeof(strom_dma_request), GFP_KERNEL);
 	if (!dma_req)
@@ -249,6 +232,6 @@ nvme_submit_async_read_cmd(strom_dma_task *dtask, struct nvme_iod *iod)
 	cmd_rq = blk_mq_rq_to_pdu(req);
 	nvme_set_info(cmd_rq, dma_req, nvme_callback_async_read_cmd);
 	nvme_submit_cmd(cmd_rq->nvmeq, &cmd);
-#endif
+
 	return retval;
 }

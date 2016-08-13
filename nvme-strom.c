@@ -30,6 +30,11 @@
 #include "nv-p2p.h"
 #include "nvme-strom.h"
 
+/* turn on/off debug message */
+static int	nvme_strom_debug = 1;
+module_param(nvme_strom_debug, int, 0644);
+MODULE_PARM_DESC(nvme_strom_debug, "");
+
 /* check the target kernel to build */
 #if defined(RHEL_MAJOR) && (RHEL_MAJOR == 7)
 #define STROM_TARGET_KERNEL_RHEL7		1
@@ -49,13 +54,18 @@
 #define Max(a,b)		((a) > (b) ? (a) : (b))
 #define Min(a,b)		((a) < (b) ? (a) : (b))
 
+/* message verbosity control */
 static int	verbose = 1;
 module_param(verbose, int, 1);
+MODULE_PARM_DESC(verbose, "turn on/off debug message");
 
 #define prDebug(fmt, ...)												\
 	do {																\
-		printk(KERN_ALERT "nvme-strom(%s:%d): " fmt "\n",				\
-			   __FUNCTION__, __LINE__, ##__VA_ARGS__);					\
+		if (verbose > 1)												\
+			printk(KERN_ALERT "nvme-strom(%s:%d): " fmt "\n",			\
+				   __FUNCTION__, __LINE__, ##__VA_ARGS__);				\
+		else if (verbose)												\
+			printk(KERN_ALERT "nvme-strom: " fmt "\n", ##__VA_ARGS__);	\
 	} while(0)
 
 #define prInfo(fmt, ...)												\
@@ -752,6 +762,15 @@ strom_ioctl_check_file(StromCmd__CheckFile __user *uarg)
  *
  * ================================================================
  */
+
+/*
+ * NOTE: It looks to us Intel 750 SSD does not accept DMA request larger
+ * than 128KB. However, we are not certain whether it is restriction for
+ * all the NVMe-SSD devices. Right now, 128KB is a default of the max unit
+ * length of DMA request.
+ */
+#define STROM_DMA_SSD2GPU_MAXLEN	(128 * 1024)
+
 #define STROM_DMA_TASK_MAX_PAGES		32
 
 struct strom_dma_task
@@ -770,6 +789,7 @@ struct strom_dma_task
 	/* Contiguous SSD blocks */
 	sector_t			src_block;	/* head of the source blocks */
 	unsigned int		nr_blocks;	/* # of the contigunous source blocks */
+	unsigned int		nr_max_blocks;	/* upper limit of @nr_blocks */
 	/* Contiguous File cache pages */
 	struct page		   *src_pages[STROM_DMA_TASK_MAX_PAGES];
 									/* array of file-cache pages */
@@ -955,8 +975,7 @@ submit_ram2gpu_memcpy(strom_dma_task *dtask)
 #error "no platform specific NVMe-SSD routines"
 #endif
 
-#if 1
-/* */
+/* alternative of the core nvme_alloc_iod */
 static struct nvme_iod *
 nvme_alloc_iod(unsigned int nsegs, size_t nbytes,
 			   struct nvme_dev *dev, gfp_t gfp)
@@ -986,7 +1005,6 @@ nvme_alloc_iod(unsigned int nsegs, size_t nbytes,
 	}
 	return iod;
 }
-#endif
 
 static int
 submit_ssd2gpu_memcpy(strom_dma_task *dtask)
@@ -1019,7 +1037,7 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 
 	base = (dtask->dest_offset >> mgmem->gpu_page_shift);
 	offset = (dtask->dest_offset & (mgmem->gpu_page_sz - 1));
-	prDebug("base=%zu offset=%zu dest_ofs=%zu total_nbytes=%zu",
+	prDebug("base=%d offset=%zu dest_ofs=%zu total_nbytes=%zu",
 			base, offset, dtask->dest_offset, total_nbytes);
 	dtask->dest_offset += total_nbytes;
 	for (i=0; i < page_table->entries; i++)
@@ -1043,7 +1061,7 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 		__nvme_free_iod(nvme_dev, iod);
 		return -EINVAL;
 	}
-	sg_mark_end(&sg[i-1]);
+	sg_mark_end(&sg[i]);
 	iod->nents = i;
 
 	retval = nvme_submit_async_read_cmd(dtask, iod);
@@ -1120,6 +1138,7 @@ strom_memcpy_ssd2gpu_wait(struct file *ioctl_filp,
 				{
 					if (first_try)
 					{
+						init_waitqueue_entry(&task_waitq[wq_index], current);
 						add_wait_queue(&dtask->wait_tasks,
 									   &task_waitq[wq_index]);
 						task_waitq_array[r_index] = &task_waitq[wq_index];
@@ -1184,10 +1203,10 @@ strom_memcpy_ssd2gpu_wait(struct file *ioctl_filp,
 }
 
 /*
- * __strom_memcpy_ssd2gpu_async - kicker of asyncronous DMA requests
+ * do_ssd2gpu_async_memcpy - kicker of asyncronous DMA requests
  */
 static long
-__strom_memcpy_ssd2gpu_async(strom_dma_task *dtask)
+do_ssd2gpu_async_memcpy(strom_dma_task *dtask)
 {
 	struct file	   *filp = dtask->filp;
 	struct page	   *fpage;
@@ -1238,7 +1257,6 @@ __strom_memcpy_ssd2gpu_async(strom_dma_task *dtask)
 
 			fpage = NULL;
 			//fpage = find_get_page(filp->f_mapping, pos >> PAGE_CACHE_SHIFT);
-			prDebug("pos=%zu fpage=%p unitsz=%zu", (size_t)pos, fpage, unitsz);
 			if (fpage)
 			{
 				/* Submit SSD2GPU DMA, if any pending request */
@@ -1317,11 +1335,9 @@ __strom_memcpy_ssd2gpu_async(strom_dma_task *dtask)
 					goto error;
 				}
 				lba_curr = bh.b_blocknr + (offset >> dtask->blocksz_shift);
-				prDebug("blksz=%zu pos=%zu bh.b_blocknr=%zu lba_curr=%zu",
-						(size_t)bh.b_size, (size_t)pos,
-						(size_t)bh.b_blocknr, (size_t)lba_curr);
 				/* can be merged with the pending request? */
 				if (dtask->nr_blocks > 0 &&
+					dtask->nr_blocks < dtask->nr_max_blocks &&
 					dtask->src_block + dtask->nr_blocks == lba_curr)
 				{
 					dtask->nr_blocks += (unitsz >> dtask->blocksz_shift);
@@ -1440,6 +1456,7 @@ strom_memcpy_ssd2gpu_async(struct file *ioctl_filp,
 	dtask->start_sect = s_bdev->bd_part->start_sect;
 	dtask->nr_sects = s_bdev->bd_part->nr_sects;
 	dtask->nr_blocks = 0;
+	dtask->nr_max_blocks = STROM_DMA_SSD2GPU_MAXLEN >> dtask->blocksz_shift;
 	dtask->nr_pages = 0;
 	dtask->head_offset = 0;
 	dtask->last_length = 0;
@@ -1460,7 +1477,7 @@ strom_memcpy_ssd2gpu_async(struct file *ioctl_filp,
 	spin_unlock(&strom_dma_task_locks[dtask->hindex]);
 
 	/* submit asynchronous DMA requests */
-	retval = __strom_memcpy_ssd2gpu_async(dtask);
+	retval = do_ssd2gpu_async_memcpy(dtask);
 	strom_put_dma_task(dtask, retval);
 	if (retval)
 	{
