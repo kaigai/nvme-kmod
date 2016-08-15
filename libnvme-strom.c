@@ -224,6 +224,7 @@ drivertest_dma_gpumem(const char *filename, int fdesc, size_t file_size,
 	uarg.chunks[0].fpos = 0;
 	uarg.chunks[0].length = file_size;
 
+	printf("Begin memcpy\n");
 	retval = nvme_strom_ioctl(STROM_IOCTL__MEMCPY_SSD2GPU, &uarg);
 	printf("STROM_IOCTL__MEMCPY_SSD2GPU(%zu bytes) --> %d: %m\n",
 		   file_size, retval);

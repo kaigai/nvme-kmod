@@ -11,12 +11,12 @@
 #include <linux/kthread.h>
 
 
-struct strom_dma_request {
+struct strom_ssd2gpu_request {
 	strom_dma_task	   *dtask;
 	struct request	   *req;
 	struct nvme_iod	   *iod;
 };
-typedef struct strom_dma_request	strom_dma_request;
+typedef struct strom_ssd2gpu_request	strom_ssd2gpu_request;
 
 struct async_cmd_info {
 	struct kthread_work work;
@@ -68,9 +68,9 @@ static void
 nvme_callback_async_read_cmd(struct nvme_queue *nvmeq, void *ctx,
 							 struct nvme_completion *cqe)
 {
-	strom_dma_request  *dma_req = (strom_dma_request *) ctx;
-	int					dma_status = le16_to_cpup(&cqe->status) >> 1;
-	u32					dma_result = le32_to_cpup(&cqe->result);
+	strom_ssd2gpu_request *ssd2gpu_req = (strom_ssd2gpu_request *) ctx;
+	int		dma_status = le16_to_cpup(&cqe->status) >> 1;
+	u32		dma_result = le32_to_cpup(&cqe->result);
 
 	/*
 	 * FIXME: dma_status is one of NVME_SC_* (like NVME_SC_SUCCESS)
@@ -79,10 +79,10 @@ nvme_callback_async_read_cmd(struct nvme_queue *nvmeq, void *ctx,
 	prDebug("DMA Req Completed status=%d result=%u", dma_status, dma_result);
 
 	/* release resources and wake up waiter */
-	__nvme_free_iod(nvmeq->dev, dma_req->iod);
-	blk_mq_free_request(dma_req->req);
-	strom_put_dma_task(dma_req->dtask, dma_status);
-	kfree(dma_req);
+	__nvme_free_iod(nvmeq->dev, ssd2gpu_req->iod);
+	blk_mq_free_request(ssd2gpu_req->req);
+	strom_put_dma_task(ssd2gpu_req->dtask, dma_status);
+	kfree(ssd2gpu_req);
 }
 
 /* -- copy from nvme-core.c -- */
@@ -138,10 +138,10 @@ static int
 nvme_submit_async_read_cmd(strom_dma_task *dtask, struct nvme_iod *iod)
 {
 	struct nvme_ns		   *nvme_ns = dtask->nvme_ns;
-	struct request		   *req			__attribute__((unused));
-	struct nvme_cmd_info   *cmd_rq		__attribute__((unused));
+	struct request		   *req;
+	struct nvme_cmd_info   *cmd_rq;
 	struct nvme_command		cmd;
-	strom_dma_request	   *dma_req		__attribute__((unused));
+	strom_ssd2gpu_request  *ssd2gpu_req;
 	size_t					length;
 	int						prp_len;
 	u16						control = 0;
@@ -149,7 +149,6 @@ nvme_submit_async_read_cmd(strom_dma_task *dtask, struct nvme_iod *iod)
 	u32						nblocks;
 	u64						slba;
 	int						retval = 0;
-	u32						hoge		__attribute__((unused));
 
 	Assert(dtask->blocksz_shift >= nvme_ns->lba_shift);
 	/* setup scatter-gather list */
@@ -187,8 +186,8 @@ nvme_submit_async_read_cmd(strom_dma_task *dtask, struct nvme_iod *iod)
 		return -ENOMEM;
 
 	/* submit an asynchronous command */
-	dma_req = kzalloc(sizeof(strom_dma_request), GFP_KERNEL);
-	if (!dma_req)
+	ssd2gpu_req = kzalloc(sizeof(strom_ssd2gpu_request), GFP_KERNEL);
+	if (!ssd2gpu_req)
 		return -ENOMEM;
 
 	req = blk_mq_alloc_request(nvme_ns->queue,
@@ -197,12 +196,12 @@ nvme_submit_async_read_cmd(strom_dma_task *dtask, struct nvme_iod *iod)
 							   false);
 	if (IS_ERR(req))
 	{
-		kfree(dma_req);
+		kfree(ssd2gpu_req);
 		return PTR_ERR(req);
 	}
-	dma_req->req = req;
-	dma_req->iod = iod;
-	dma_req->dtask = strom_get_dma_task(dtask);
+	ssd2gpu_req->req = req;
+	ssd2gpu_req->iod = iod;
+	ssd2gpu_req->dtask = strom_get_dma_task(dtask);
 
 	/* setup READ command */
 	if (req->cmd_flags & REQ_FUA)
@@ -230,7 +229,7 @@ nvme_submit_async_read_cmd(strom_dma_task *dtask, struct nvme_iod *iod)
 	 * Linux kernel of RHEL7 does not use these fields.
 	 */
 	cmd_rq = blk_mq_rq_to_pdu(req);
-	nvme_set_info(cmd_rq, dma_req, nvme_callback_async_read_cmd);
+	nvme_set_info(cmd_rq, ssd2gpu_req, nvme_callback_async_read_cmd);
 	nvme_submit_cmd(cmd_rq->nvmeq, &cmd);
 
 	return retval;
