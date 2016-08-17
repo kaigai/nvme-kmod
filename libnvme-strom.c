@@ -217,6 +217,7 @@ drivertest_dma_gpumem(const char *filename, int fdesc, size_t file_size,
 	cuda_exit_on_error(rc, "cuMemAllocHost");
 
 	/* src_buffer -> GPU RAM */
+	uarg.status = 0;
 	uarg.handle = handle;
 	uarg.offset = 0;
 	uarg.fdesc = fdesc;
