@@ -9,18 +9,15 @@ CUDA_PATH := $(shell for x in $(CUDA_PATH_LIST);    \
 	do test -e "$$x/include/cuda.h" && echo $$x; done | head -1)
 USERSPACE_FLAGS := -I $(CUDA_PATH)/include -L $(CUDA_PATH)/lib64 -lcuda
 
-EXTRA_CLEAN := driver_test libnvme-strom.so
+EXTRA_CLEAN := nvme_test
 
-obj-m := nvme-strom.o
+obj-m := nvme_strom.o
 ccflags-y := -I. -I$(NVIDIA_SOURCE)
 
-default: modules driver_test libnvme-strom.so
+default: modules nvme_test
 
-driver_test: libnvme-strom.c nvme-strom.h
+nvme_test: nvme_test.c nvme_strom.h
 	$(CC) -o $@ $(USERSPACE_FLAGS) -DBUILD_AS_DRIVERTEST $<
-
-libnvme-strom.so: libnvme-strom.c nvme-strom.h
-	$(CC) -o $@ -c -fpic $(USERSPACE_FLAGS) $<
 
 clean:
 	rm -f $(EXTRA_CLEAN)

@@ -21,6 +21,9 @@ enum {
 	STROM_IOCTL__DEBUG					= _IO('S',0x87),
 };
 
+/* path of ioctl(2) entrypoint */
+#define NVME_STROM_IOCTL_PATHNAME		"/proc/nvme-strom"
+
 /* STROM_IOCTL__CHECK_FILE */
 struct StromCmd__CheckFile
 {

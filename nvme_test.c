@@ -20,7 +20,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include "nvme-strom.h"
+#include "nvme_strom.h"
 
 /*
  *
@@ -33,10 +33,11 @@ nvme_strom_ioctl(int cmd, const void *arg)
 
 	if (fdesc_nvme_strom < 0)
 	{
-		fdesc_nvme_strom = open("/proc/nvme-strom", O_RDONLY);
+		fdesc_nvme_strom = open(NVME_STROM_IOCTL_PATHNAME, O_RDONLY);
 		if (fdesc_nvme_strom < 0)
 		{
-			fprintf(stderr, "failed to open \"/proc/nvme-strom\" : %m\n");
+			fprintf(stderr, "failed to open \"%s\" : %m\n",
+					NVME_STROM_IOCTL_PATHNAME);
 			return -1;
 		}
 	}

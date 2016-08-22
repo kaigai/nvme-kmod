@@ -29,7 +29,7 @@
 #include <linux/slab.h>
 #include <linux/version.h>
 #include "nv-p2p.h"
-#include "nvme-strom.h"
+#include "nvme_strom.h"
 
 /* turn on/off debug message */
 static int	nvme_strom_debug = 1;
@@ -92,7 +92,7 @@ MODULE_PARM_DESC(verbose, "turn on/off debug message");
 	} while(0)
 
 /* routines for extra symbols */
-#include "extra-ksyms.c"
+#include "extra_ksyms.c"
 
 /*
  * for boundary alignment requirement
@@ -1032,7 +1032,7 @@ retry:
  * DMA transaction for SSD->GPU asynchronous copy
  */
 #ifdef STROM_TARGET_KERNEL_RHEL7
-#include "nvme-strom.rhel7.c"
+#include "nvme_strom.rhel7.c"
 #else
 #error "no platform specific NVMe-SSD routines"
 #endif
