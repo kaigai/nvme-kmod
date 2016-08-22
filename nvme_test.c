@@ -220,7 +220,6 @@ drivertest_dma_gpumem(const char *filename, int fdesc, size_t file_size,
 	/* src_buffer -> GPU RAM */
 	uarg.status = 0;
 	uarg.handle = handle;
-	uarg.offset = 0;
 	uarg.fdesc = fdesc;
 	uarg.nchunks = 1;
 	uarg.chunks[0].fpos = 0;

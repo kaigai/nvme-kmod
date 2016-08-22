@@ -67,7 +67,10 @@ typedef struct StromCmd__InfoGpuMemory	StromCmd__InfoGpuMemory;
 /* STROM_IOCTL__MEMCPY_SSD2GPU */
 struct strom_dma_chunk
 {
-	loff_t			fpos;		/* in: file position from the head */
+	loff_t			fpos;		/* in: position of the source file from 
+								 *     the head of file */
+	size_t			offset;		/* in: offset of the destination buffer from
+								 *     the head of mapped GPU memory */
 	size_t			length;		/* in: length of this chunk */
 };
 typedef struct strom_dma_chunk	strom_dma_chunk;
@@ -76,8 +79,6 @@ struct StromCmd__MemCpySsdToGpu
 {
 	long			status;		/* out: status of this DMA operation */
 	unsigned long	handle;		/* in: handler of the mapped GPU memory */
-	size_t			offset;		/* in: destination offset from the head of
-								 *     this mapped region */
 	int				fdesc;		/* in: file descriptor, if any. Or, -1 */
 	int				nchunks;	/* in: number of the source chunks */
 	strom_dma_chunk	chunks[1];	/* in: ...variable length array... */
@@ -90,8 +91,6 @@ struct StromCmd__MemCpySsdToGpuAsync
 	unsigned long	dma_task_id;/* out: identifier of the DMA task */
 	long		   *p_status;	/* in: pointer to the async DMA status field */
 	unsigned long	handle;		/* in: handler of the mapped GPU memory */
-	size_t			offset;		/* in: destination offset from head of
-								 *     the mapped region */
 	int				fdesc;		/* in: file descriptor, if any. Or, -1 */
 	int				nchunks;	/* in: number of the source chunks */
 	strom_dma_chunk	chunks[1];	/* in: ...variable length array... */
