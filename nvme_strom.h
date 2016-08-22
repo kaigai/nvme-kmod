@@ -114,6 +114,4 @@ typedef struct
 	unsigned long	offset;
 	unsigned long	length;
 } StromCmd__Debug;
-
-
 #endif /* NVME_STROM_H */

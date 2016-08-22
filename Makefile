@@ -7,7 +7,7 @@ NVIDIA_SOURCE := $(shell ls -St /usr/src/nvidia-*/nv-p2p.h | \
 CUDA_PATH_LIST := /usr/local/cuda /usr/local/cuda-*
 CUDA_PATH := $(shell for x in $(CUDA_PATH_LIST);    \
 	do test -e "$$x/include/cuda.h" && echo $$x; done | head -1)
-USERSPACE_FLAGS := -I $(CUDA_PATH)/include -L $(CUDA_PATH)/lib64 -lcuda
+USERSPACE_FLAGS := -I $(CUDA_PATH)/include -L $(CUDA_PATH)/lib64 -lcuda -lpthread
 
 EXTRA_CLEAN := nvme_test
 
@@ -17,7 +17,7 @@ ccflags-y := -I. -I$(NVIDIA_SOURCE)
 default: modules nvme_test
 
 nvme_test: nvme_test.c nvme_strom.h
-	$(CC) -o $@ $(USERSPACE_FLAGS) -DBUILD_AS_DRIVERTEST $<
+	$(CC) -Wall nvme_test.c -o $@ $(USERSPACE_FLAGS)
 
 clean:
 	rm -f $(EXTRA_CLEAN)
