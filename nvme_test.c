@@ -61,30 +61,29 @@ nvme_strom_ioctl(int cmd, const void *arg)
 	return ioctl(fdesc_nvme_strom, cmd, arg);
 }
 
-static void
-cuda_exit_on_error(CUresult rc, const char *apiname)
-{
-	if (rc != CUDA_SUCCESS)
-	{
-		const char *error_name;
+#define cuda_exit_on_error(__RC, __API_NAME)							\
+	do {																\
+		if ((__RC) != CUDA_SUCCESS)										\
+		{																\
+			const char *error_name;										\
+																		\
+			if (cuGetErrorName((__RC), &error_name) != CUDA_SUCCESS)	\
+				error_name = "unknown error";							\
+			fprintf(stderr, "%d: failed on %s: %s\n",					\
+					__LINE__, __API_NAME, error_name);					\
+			exit(1);													\
+		}																\
+	} while(0)
 
-		if (cuGetErrorName(rc, &error_name) != CUDA_SUCCESS)
-			error_name = "unknown error";
-
-		fprintf(stderr, "failed on %s: %s\n", apiname, error_name);
-		exit(1);
-	}
-}
-
-static void
-system_exit_on_error(int rc, const char *apiname)
-{
-	if (rc)
-	{
-		fprintf(stderr, "failed on %s: %m\n", apiname);
-		exit(1);
-	}
-}
+#define system_exit_on_error(__RC, __API_NAME)							\
+	do {																\
+		if ((__RC))														\
+		{																\
+			fprintf(stderr, "%d: failed on %s: %m\n",					\
+					__LINE__, __API_NAME);								\
+			exit(1);													\
+		}																\
+	} while(0)
 
 static void
 ioctl_check_file(const char *filename, int fdesc)
@@ -265,32 +264,47 @@ show_throughput(const char *filename, size_t file_size,
 {
 	long		time_ms;
 	double		throughput;
-	const char *unitsz;
+	char		buf[256];
+	int			ofs = 0;
 
 	time_ms = ((tv2.tv_sec * 1000 + tv2.tv_usec / 1000) -
 			   (tv1.tv_sec * 1000 + tv1.tv_usec / 1000));
-	throughput = (double)file_size / (double)(time_ms / 1000);
-	if (throughput < (double)(4UL << 10))
-	{
-		unitsz = "Bytes";
-	}
-	else if (throughput < (double)(4UL << 20))
-	{
-		throughput /= (double)(1UL << 10);
-		unitsz = "KB";
-	}
-	else if (throughput < (double)(4UL << 30))
-	{
-		throughput /= (double)(1UL << 20);
-		unitsz = "MB";
-	}
+	throughput = (double)file_size / ((double)time_ms / 1000.0);
+
+	if (file_size < (4UL << 10))
+		ofs += snprintf(buf+ofs, sizeof(buf)-ofs, "read: %zuBytes",
+						file_size);
+	else if (file_size < (4UL << 20))
+		ofs += snprintf(buf+ofs, sizeof(buf)-ofs, "read: %.2fKB",
+						(double)file_size / (double)(1UL << 10));
+	else if (file_size < (4UL << 30))
+		ofs += snprintf(buf+ofs, sizeof(buf)-ofs, "read: %.2fMB",
+						(double)file_size / (double)(1UL << 20));
 	else
-	{
-		throughput /= (double)(1UL << 30);
-        unitsz = "GB";
-	}
-	printf("file: %s, read: %luKB, time: %.3fms, band: %.2f%s/s\n",
-		   filename, file_size, (double)time_ms, throughput, unitsz);
+		ofs += snprintf(buf+ofs, sizeof(buf)-ofs, "read: %.2fGB",
+						(double)file_size / (double)(1UL << 30));
+
+	if (time_ms < 4000UL)
+		ofs += snprintf(buf+ofs, sizeof(buf)-ofs, ", time: %lums",
+						time_ms);
+	else
+		ofs += snprintf(buf+ofs, sizeof(buf)-ofs, ", time: %.2fsec",
+						(double)time_ms / 1000.0);
+
+	if (throughput < (double)(4UL << 10))
+		ofs += snprintf(buf+ofs, sizeof(buf)-ofs, ", throughput: %zuB/s",
+						(size_t)throughput);
+	else if (throughput < (double)(4UL << 20))
+		ofs += snprintf(buf+ofs, sizeof(buf)-ofs, ", throughput: %.2fKB/s",
+						throughput / (double)(1UL << 10));
+	else if (throughput < (double)(4UL << 30))
+		ofs += snprintf(buf+ofs, sizeof(buf)-ofs, ", throughput: %.2fMB/s",
+						throughput / (double)(1UL << 20));
+	else
+		ofs += snprintf(buf+ofs, sizeof(buf)-ofs, ", throughput: %.2fGB/s",
+						throughput / (double)(1UL << 30));
+
+	printf("file: %s, %s\n", filename, buf);
 }
 
 static void
@@ -344,6 +358,7 @@ exec_test_by_strom(CUdeviceptr cuda_devptr, unsigned long handle,
 		rv = nvme_strom_ioctl(STROM_IOCTL__MEMCPY_SSD2GPU_ASYNC, &uarg);
 		system_exit_on_error(rv, "STROM_IOCTL__MEMCPY_SSD2GPU_ASYNC");
 		atask->dma_task_id    = uarg.dma_task_id;
+		printf("fpos=%zu task_id=%lu\n", offset, uarg.dma_task_id);
 
 		/* kick callback for synchronization */
 		rc = cuStreamAddCallback(atask->cuda_stream,
@@ -376,7 +391,6 @@ exec_test_by_strom(CUdeviceptr cuda_devptr, unsigned long handle,
 		}
 		pthread_mutex_unlock(&buffer_lock);
 	} while (j < num_chunks);
-
 	gettimeofday(&tv2, NULL);
 	show_throughput(filename, file_size, tv1, tv2);
 }
@@ -421,18 +435,20 @@ exec_test_by_vfs(CUdeviceptr cuda_devptr, unsigned long handle,
 
 		/* Load SSD-to-RAM */
 		retval = read(fdesc, atask->src_buffer, chunk_size);
-		system_exit_on_error(retval != chunk_size, "read");
+		if (retval == 0)
+			break;	/* EOF */
+		system_exit_on_error(retval < 0, "read");
 
 		/* Kick RAM-to-GPU DMA */
 		rc = cuMemcpyHtoDAsync(cuda_devptr + atask->index * chunk_size,
-							   atask->src_buffer, chunk_size,
+							   atask->src_buffer, retval,
 							   atask->cuda_stream);
 		cuda_exit_on_error(rc, "cuMemcpyHtoDAsync");
 
 		/* Kick GPU-to-RAM DMA */
 		rc = cuMemcpyDtoHAsync(atask->dest_buffer,
 							   cuda_devptr + atask->index * chunk_size,
-							   chunk_size,
+							   retval,
 							   atask->cuda_stream);
 		cuda_exit_on_error(rc, "cuMemcpyDtoHAsync");
 
@@ -494,7 +510,7 @@ int main(int argc, char * const argv[])
 	unsigned long	mgmem_handle;
 	int				code;
 
-	while ((code = getopt(argc, argv, "d:n:s:cpf")) != 0)
+	while ((code = getopt(argc, argv, "d:n:s:cpfh")) >= 0)
 	{
 		switch (code)
 		{
@@ -519,6 +535,7 @@ int main(int argc, char * const argv[])
 			case 'h':
 			default:
 				usage(argv[0]);
+				break;
 		}
 	}
 	buffer_size = (size_t)chunk_size * num_chunks;

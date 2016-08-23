@@ -1608,7 +1608,7 @@ strom_ioctl_memcpy_ssd2gpu_async(StromCmd__MemCpySsdToGpuAsync __user *uarg)
 	long			retval;
 
 	if (copy_from_user(&karg, uarg,
-					   offsetof(StromCmd__MemCpySsdToGpu, chunks)))
+					   offsetof(StromCmd__MemCpySsdToGpuAsync, chunks)))
 		return -EFAULT;
 
 	retval = strom_memcpy_ssd2gpu_async(karg.handle, karg.fdesc,
@@ -1673,10 +1673,12 @@ strom_ioctl_memcpy_ssd2gpu_wait(StromCmd__MemCpySsdToGpuWait __user *uarg)
 									   karg->dma_task_id);
 	if (retval >= 0)
 	{
+		karg->nwaits = retval;
 		if (copy_to_user(uarg, karg,
 						 offsetof(StromCmd__MemCpySsdToGpuWait,
 								  dma_task_id[karg->nwaits])))
 			retval = -EFAULT;
+		retval = 0;
 	}
 
 	if (karg != &__karg)
