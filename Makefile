@@ -11,7 +11,7 @@ NVIDIA_SOURCE := $(shell ls -St /usr/src/nvidia-*/nv-p2p.h | \
 CUDA_PATH_LIST := /usr/local/cuda /usr/local/cuda-*
 CUDA_PATH := $(shell for x in $(CUDA_PATH_LIST);    \
 	do test -e "$$x/include/cuda.h" && echo $$x; done | head -1)
-USERSPACE_FLAGS := -I $(CUDA_PATH)/include -L $(CUDA_PATH)/lib64
+USERSPACE_FLAGS := -g -I $(CUDA_PATH)/include -L $(CUDA_PATH)/lib64
 
 EXTRA_CLEAN := nvme_test
 

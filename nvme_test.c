@@ -38,6 +38,7 @@ static size_t	chunk_size = 32UL << 20;
 static int		enable_checks = 0;
 static int		print_mapping = 0;
 static int		test_by_vfs = 0;
+static size_t	vfs_io_size = 0;
 
 static sem_t	buffer_sem;
 static pthread_mutex_t	buffer_lock;
@@ -359,7 +360,6 @@ exec_test_by_strom(CUdeviceptr cuda_devptr, unsigned long handle,
 		rv = nvme_strom_ioctl(STROM_IOCTL__MEMCPY_SSD2GPU_ASYNC, &uarg);
 		system_exit_on_error(rv, "STROM_IOCTL__MEMCPY_SSD2GPU_ASYNC");
 		atask->dma_task_id    = uarg.dma_task_id;
-		printf("fpos=%zu task_id=%lu\n", offset, uarg.dma_task_id);
 
 		/* kick callback for synchronization */
 		rc = cuStreamAddCallback(atask->cuda_stream,
@@ -404,6 +404,7 @@ exec_test_by_vfs(CUdeviceptr cuda_devptr, unsigned long handle,
 	CUresult		rc;
 	int				i, j, rv;
 	size_t			offset;
+	size_t			pos;
 	ssize_t			retval;
 	struct timeval	tv1, tv2;
 
@@ -422,10 +423,7 @@ exec_test_by_vfs(CUdeviceptr cuda_devptr, unsigned long handle,
 		{
 			atask = &async_tasks[i++ % num_chunks];
 			if (!atask->is_running)
-			{
-				atask->is_running = 1;
 				break;		/* found */
-			}
 		}
 		if (j == num_chunks)
 		{
@@ -435,10 +433,17 @@ exec_test_by_vfs(CUdeviceptr cuda_devptr, unsigned long handle,
 		pthread_mutex_unlock(&buffer_lock);
 
 		/* Load SSD-to-RAM */
-		retval = read(fdesc, atask->src_buffer, chunk_size);
-		if (retval == 0)
-			break;	/* EOF */
+		for (pos=0; pos < chunk_size; pos += vfs_io_size)
+		{
+			retval = read(fdesc, atask->src_buffer + pos, vfs_io_size);
+			if (retval < vfs_io_size)
+				break;
+		}
 		system_exit_on_error(retval < 0, "read");
+		if (pos == 0)
+			break;	/* EOF */
+
+		atask->is_running = 1;
 
 		/* Kick RAM-to-GPU DMA */
 		rc = cuMemcpyHtoDAsync(cuda_devptr + atask->index * chunk_size,
@@ -489,7 +494,7 @@ static void usage(const char *cmdname)
 			"    -s <size of chunk in MB>: (default 32MB)\n"
 			"    -c : Enables corruption check (default off)\n"
 			"    -h : Print this message (default off)\n"
-			"    -f : Test by normal VFS access (default off)\n",
+			"    -f (i/o size in KB): Test by VFS access (default off)\n",
 			basename(strdup(cmdname)));
 	exit(1);
 }
@@ -511,7 +516,7 @@ int main(int argc, char * const argv[])
 	unsigned long	mgmem_handle;
 	int				code;
 
-	while ((code = getopt(argc, argv, "d:n:s:cpfh")) >= 0)
+	while ((code = getopt(argc, argv, "d:n:s:cpf::h")) >= 0)
 	{
 		switch (code)
 		{
@@ -532,6 +537,8 @@ int main(int argc, char * const argv[])
 				break;
 			case 'f':
 				test_by_vfs = 1;
+				if (optarg)
+					vfs_io_size = (size_t)atoi(optarg) << 10;
 				break;
 			case 'h':
 			default:
@@ -545,6 +552,15 @@ int main(int argc, char * const argv[])
 		filename = argv[optind];
 	else
 		usage(argv[0]);
+
+	if (vfs_io_size == 0)
+		vfs_io_size = chunk_size;
+	else if (chunk_size % vfs_io_size != 0)
+	{
+		fprintf(stderr, "VFS I/O size (%zuKB) mismatch to ChunkSize (%zuMB)\n",
+				vfs_io_size >> 10, chunk_size >> 20);
+		return 1;
+	}
 
 	/* open the target file */
 	fdesc = open(filename, O_RDONLY);

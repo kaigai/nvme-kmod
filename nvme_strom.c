@@ -198,7 +198,7 @@ strom_get_mapped_gpu_memory(unsigned long handle)
 			Assert(mgmem->hindex == index);
 
 			mgmem->refcnt++;
-			spin_unlock(lock);
+			spin_unlock_irqrestore(lock, flags);
 
 			return mgmem;
 		}
@@ -461,7 +461,7 @@ strom_ioctl_unmap_gpu_memory(StromCmd__UnmapGpuMemory __user *uarg)
 		{
 			list_del(&mgmem->chain);
 			memset(&mgmem->chain, 0, sizeof(struct list_head));
-			spin_unlock(lock);
+			spin_unlock_irqrestore(lock, flags);
 
 			rc = __nvidia_p2p_put_pages(0, 0,
 										mgmem->map_address,
