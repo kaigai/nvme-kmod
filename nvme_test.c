@@ -28,6 +28,8 @@
 #include "nvme_strom.h"
 
 #define offsetof(type, field)   ((long) &((type *)0)->field)
+#define Max(a,b)				((a) > (b) ? (a) : (b))
+#define Min(a,b)				((a) < (b) ? (a) : (b))
 
 /* command line options */
 static int		device_index = 0;
@@ -169,7 +171,6 @@ typedef struct
 	int				is_running;
 	CUstream		cuda_stream;
 	unsigned long	dma_task_id;
-	long			status;
 	void		   *src_buffer;
 	void		   *dest_buffer;
 } async_task;
@@ -187,8 +188,11 @@ callback_dma_wait(CUstream cuda_stream, CUresult status, void *private)
 	uarg.nwaits = 1;
 	uarg.dma_task_id[0] = atask->dma_task_id;
 	rv = nvme_strom_ioctl(STROM_IOCTL__MEMCPY_SSD2GPU_WAIT, &uarg);
+	if (uarg.status)
+		printf("async dma (id=%lu, status=%ld)\n",
+			   uarg.nwaits > 0 ? uarg.dma_task_id[0] : 0,
+			   uarg.status);
 	system_exit_on_error(rv, "STROM_IOCTL__MEMCPY_SSD2GPU_WAIT");
-	system_exit_on_error(atask->status, "Async SSD-to-GPU DMA");
 }
 
 static void
@@ -242,7 +246,6 @@ setup_async_tasks(int fdesc)
 		rc = cuStreamCreate(&async_tasks[i].cuda_stream,
 							CU_STREAM_DEFAULT);
 		cuda_exit_on_error(rc, "cuStreamCreate");
-		async_tasks[i].status = 0;
 
 		if (enable_checks || test_by_vfs)
 		{
@@ -311,7 +314,7 @@ static void
 exec_test_by_strom(CUdeviceptr cuda_devptr, unsigned long handle,
 				   const char *filename, int fdesc, size_t file_size)
 {
-	StromCmd__MemCpySsdToGpuAsync uarg;
+	StromCmd__MemCpySsdToGpu uarg;
 	async_task	   *async_tasks;
 	CUresult		rc;
 	int				i, j, rv;
@@ -347,14 +350,12 @@ exec_test_by_strom(CUdeviceptr cuda_devptr, unsigned long handle,
 
 		/* kick SSD-to-GPU DMA */
 		memset(&uarg, 0, sizeof(uarg));
-		atask->status         = 0;
-		uarg.p_status         = &atask->status;
 		uarg.handle           = handle;
 		uarg.fdesc            = fdesc;
 		uarg.nchunks          = 1;
 		uarg.chunks[0].fpos   = offset;
 		uarg.chunks[0].offset = atask->index * chunk_size;
-		uarg.chunks[0].length = chunk_size;
+		uarg.chunks[0].length = Min(file_size - offset, chunk_size);
 		rv = nvme_strom_ioctl(STROM_IOCTL__MEMCPY_SSD2GPU_ASYNC, &uarg);
 		system_exit_on_error(rv, "STROM_IOCTL__MEMCPY_SSD2GPU_ASYNC");
 		atask->dma_task_id    = uarg.dma_task_id;

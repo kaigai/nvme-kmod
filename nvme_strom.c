@@ -28,6 +28,7 @@
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/version.h>
+#include <generated/utsrelease.h>
 #include "nv-p2p.h"
 #include "nvme_strom.h"
 
@@ -40,7 +41,7 @@ MODULE_PARM_DESC(nvme_strom_debug, "");
 #if defined(RHEL_MAJOR) && (RHEL_MAJOR == 7)
 #define STROM_TARGET_KERNEL_RHEL7		1
 #else
-#error Linux kernel not supported
+#error Not a supported Linux kernel
 #endif
 
 /* utility macros */
@@ -56,7 +57,7 @@ MODULE_PARM_DESC(nvme_strom_debug, "");
 #define Min(a,b)		((a) < (b) ? (a) : (b))
 
 /* message verbosity control */
-static int	verbose = 1;
+static int	verbose = 0;
 module_param(verbose, int, 1);
 MODULE_PARM_DESC(verbose, "turn on/off debug message");
 
@@ -77,8 +78,7 @@ MODULE_PARM_DESC(verbose, "turn on/off debug message");
 
 #define prNotice(fmt, ...)												\
 	do {																\
-		if (verbose)													\
-			printk(KERN_NOTICE "nvme-strom: " fmt "\n", ##__VA_ARGS__);	\
+		printk(KERN_NOTICE "nvme-strom: " fmt "\n", ##__VA_ARGS__);		\
 	} while(0)
 
 #define prWarn(fmt, ...)						\
@@ -310,7 +310,7 @@ strom_ioctl_map_gpu_memory(StromCmd__MapGpuMemory __user *uarg)
 	unsigned long		handle;
 	unsigned long		flags;
 	uint32_t			entries;
-	int					i, rc;
+	int					rc;
 
 	if (copy_from_user(&karg, uarg, sizeof(karg)))
 		return -EFAULT;
@@ -377,9 +377,11 @@ strom_ioctl_map_gpu_memory(StromCmd__MapGpuMemory __user *uarg)
 		goto error_2;
 	}
 
-	/* debug output */
+#if 0
+	/* Debug Output */
 	{
 		nvidia_p2p_page_table_t *page_table = mgmem->page_table;
+		int			i;
 
 		prNotice("P2P GPU Memory (handle=%p) mapped "
 				 "(version=%u, page_size=%zu, entries=%u)",
@@ -394,7 +396,7 @@ strom_ioctl_map_gpu_memory(StromCmd__MapGpuMemory __user *uarg)
 					 (void *)(page_table->pages[i]->physical_address));
 		}
 	}
-
+#endif
 	/*
 	 * Warning message if mapped device memory is not aligned well
 	 */
@@ -758,23 +760,17 @@ struct strom_dma_task
 	 * MEMO: Pay attention to error status of the asynchronous tasks.
 	 * Asynchronous task may cause errors on random timing, and kernel
 	 * space wants to inform this status on the next call. On the other
-	 * hands, application may not invoke ioctl(2) on /proc/nvme-strom any
-	 * more. Thus, we thought, it is not a good idea to keep error status
-	 * that is associated with a particular DMA task ID until next call,
-	 * because it  may make very long unreferenced list.
-	 * Instead of this approach, we put an error status on the file-
-	 * handler of ioctl(2) entrypoint which has just one slot for error
-	 * status. Instead of this simplification, application may receive
-	 * unrelated error status by the previous asynchronous tasks.
-	 * Right now, we assume it is not a big problem because application
-	 * has to fix up the problem more or less when DMA request gets
-	 * aborted. It is similar behavior when we use asynchronous CUDA APIs.
+	 * hands, application may invoke ioctl(2) to reference DMA results,
+	 * but may not. So, we have to keep an error status somewhere, but
+	 * also needs to be released on appropriate timing; to avoid kernel
+	 * memory leak by rude applications.
+	 * If any errors, we attach strom_dma_task structure on file handler
+	 * used for ioctl(2). The error status shall be reclaimed on the
+	 * next time when application wait for a particular DMA task, or
+	 * this file handler is closed.
 	 */
-
-	/* status of the DMA task */
-	long			   *p_kern_status;
-	struct page		   *user_status_page;
-	size_t				user_status_offset;
+	long				dma_status;
+	struct file		   *ioctl_filp;
 
 	/* definition of the chunks */
 	unsigned int		nchunks;
@@ -801,9 +797,10 @@ struct strom_dma_state
 };
 typedef struct strom_dma_state	strom_dma_state;
 
-#define STROM_DMA_TASK_NSLOTS	100
+#define STROM_DMA_TASK_NSLOTS		100
 static spinlock_t		strom_dma_task_locks[STROM_DMA_TASK_NSLOTS];
 static struct list_head	strom_dma_task_slots[STROM_DMA_TASK_NSLOTS];
+static struct list_head	failed_dma_task_slots[STROM_DMA_TASK_NSLOTS];
 
 /*
  * strom_dma_task_index
@@ -840,54 +837,47 @@ strom_get_dma_task(strom_dma_task *dtask)
 static void
 strom_put_dma_task(strom_dma_task *dtask, long dma_status)
 {
-	int				index = strom_dma_task_index(dtask->dma_task_id);
-	spinlock_t	   *lock = &strom_dma_task_locks[index];
-	unsigned long	flags;
+	int					index = strom_dma_task_index(dtask->dma_task_id);
+	spinlock_t		   *lock = &strom_dma_task_locks[index];
+	struct list_head   *slot;
+	unsigned long		flags;
 
 	spin_lock_irqsave(lock, flags);
 	Assert(dtask->refcnt > 0);
-	/* put error status if any */
-	if (dma_status)
+
+	if (dma_status && !dtask->dma_status)
 	{
-		if (dtask->p_kern_status)
-		{
-			*dtask->p_kern_status = dma_status;
-			dtask->p_kern_status = NULL;	/* only first error */
-		}
-		if (dtask->user_status_page)
-		{
-			char   *status_page = kmap_atomic(dtask->user_status_page);
-
-			if (put_user(dma_status, (long *)(status_page +
-											  dtask->user_status_offset)))
-				prError("DMA task ID=%p failed to put status: %ld",
-						(void *)dtask->dma_task_id, dma_status);
-			kunmap_atomic(status_page);
-
-			put_page(dtask->user_status_page);
-			dtask->user_status_page = NULL;
-		}
+		Assert(dma_status < 0);
+		dtask->dma_status = dma_status;
 	}
 
 	if (--dtask->refcnt == 0)
 	{
-		/* detach from the hash table */
-		list_del(&dtask->chain);
+		struct file	   *ioctl_filp = dtask->ioctl_filp;
+		long			status = dtask->dma_status;
 
+		/* detach from the global hash table */
+		list_del(&dtask->chain);
+		/* if any error status, move to the ioctl_filp without kfree() */
+		if (status)
+		{
+			slot = &failed_dma_task_slots[index];
+			list_add_tail(slot, &dtask->chain);
+		}
 		/* wake up all the waiting tasks, if any */
 		wake_up_all(&dtask->wait_tasks);
-
-		spin_unlock_irqrestore(lock, flags);
-
 		/* release relevant resources */
 		strom_put_mapped_gpu_memory(dtask->mgmem);
 		fput(dtask->filp);
 		if (dtask->dma_chan && dtask->dma_chan != (void *)(~0UL))
 			dma_release_channel(dtask->dma_chan);
-		if (dtask->user_status_page)
-			put_page(dtask->user_status_page);
+		if (!status)
+			kfree(dtask);
+		spin_unlock_irqrestore(lock, flags);
+
+		fput(ioctl_filp);
+
 		prInfo("DMA task (id=%p) was completed", dtask);
-		kfree(dtask);
 
 		return;
 	}
@@ -1146,21 +1136,25 @@ submit_ssd2gpu_memcpy(strom_dma_state *dstate)
 static int
 strom_memcpy_ssd2gpu_wait(unsigned int ntasks,
 						  unsigned int nwaits,
-						  unsigned long *dma_task_id_array)
+						  unsigned long *dma_task_id_array,
+						  unsigned long *p_failed_dma_task_id,
+						  long *p_failed_dma_status)
 {
-	strom_dma_task *dtask;
-	wait_queue_t	__task_waitq[20];
-	wait_queue_t   *task_waitq;
-	wait_queue_t   *__task_waitq_array[20];
-	wait_queue_t  **task_waitq_array;
-	unsigned long	dma_task_id;
-	unsigned long	flags;
-	bool			first_try = true;
-	int				wq_index = 0;
-	int				w_index = 0;
-	int				r_index;
-	int				h_index;
-	int				retval = 0;
+	strom_dma_task	   *dtask;
+	wait_queue_t		__task_waitq[20];
+	wait_queue_t	   *task_waitq;
+	wait_queue_t	   *__task_waitq_array[20];
+	wait_queue_t	  **task_waitq_array;
+	unsigned long		dma_task_id;
+	unsigned long		flags;
+	spinlock_t		   *lock;
+	struct list_head   *slot;
+	bool				first_try = true;
+	int					wq_index = 0;
+	int					w_index = 0;
+	int					r_index;
+	int					hindex;
+	int					retval = 0;
 
 	/* temporary buffer for wait queue */
 	if (ntasks <= lengthof(__task_waitq))
@@ -1194,12 +1188,41 @@ strom_memcpy_ssd2gpu_wait(unsigned int ntasks,
 		for (r_index = w_index; r_index < ntasks; r_index++)
 		{
 			dma_task_id = dma_task_id_array[r_index];
-			h_index = strom_dma_task_index(dma_task_id);
+			hindex = strom_dma_task_index(dma_task_id);
 
-			spin_lock_irqsave(&strom_dma_task_locks[h_index], flags);
-			list_for_each_entry(dtask, &strom_dma_task_slots[h_index], chain)
+			lock = &strom_dma_task_locks[hindex];
+			spin_lock_irqsave(lock, flags);
+
+			/*
+			 * Look up failed DMA tasks first to pick up its error status
+			 * and return it immediately, if any.
+			 */
+			slot = &failed_dma_task_slots[hindex];
+			list_for_each_entry(dtask, slot, chain)
 			{
-				/* this task is still in-progress */
+				if (dtask->dma_task_id == dma_task_id)
+				{
+					if (p_failed_dma_task_id)
+						*p_failed_dma_task_id = dma_task_id;
+					if (p_failed_dma_status)
+						*p_failed_dma_status = dtask->dma_status;
+					list_del(&dtask->chain);
+					kfree(dtask);
+					spin_unlock_irqrestore(lock, flags);
+
+					retval = -EIO;
+
+					goto bailout;
+				}
+			}
+
+			/*
+			 * OK, this DMA task either still running or successfully done.
+			 */
+			slot = &strom_dma_task_slots[hindex];
+			list_for_each_entry(dtask, slot, chain)
+			{
+				/* Hmm, this task is still in-progress */
 				if (dtask->dma_task_id == dma_task_id)
 				{
 					if (first_try)
@@ -1213,14 +1236,14 @@ strom_memcpy_ssd2gpu_wait(unsigned int ntasks,
 					goto found;
 				}
 			}
-			/* move the completed tasks to the first half */
+			/* move the completed tasks to the earlier half */
 			dma_task_id_array[r_index] = dma_task_id_array[w_index];
-            dma_task_id_array[w_index] = dma_task_id;
+			dma_task_id_array[w_index] = dma_task_id;
 			task_waitq_array[r_index] = task_waitq_array[w_index];
 			task_waitq_array[w_index] = NULL;	/* already not valid */
 			w_index++;
 		found:
-			spin_unlock_irqrestore(&strom_dma_task_locks[h_index], flags);
+			spin_unlock_irqrestore(lock, flags);
 		}
 
 		if (w_index >= nwaits)
@@ -1234,17 +1257,24 @@ strom_memcpy_ssd2gpu_wait(unsigned int ntasks,
 		/* sleep until somebody kicks me */
 		schedule();
 	}
+bailout:
 	/* revert current task status */
 	set_current_state(TASK_RUNNING);
 
-	/* remove this task from the remaining dma_tasks */
+	/*
+	 * Remove the current context from wait-queue of the DMA task which
+	 * is still running.
+	 */
 	for (r_index = w_index; r_index < ntasks; r_index++)
 	{
 		dma_task_id = dma_task_id_array[r_index];
-		h_index = strom_dma_task_index(dma_task_id);
+		hindex = strom_dma_task_index(dma_task_id);
 
-		spin_lock_irqsave(&strom_dma_task_locks[h_index], flags);
-		list_for_each_entry(dtask, &strom_dma_task_slots[h_index], chain)
+		lock = &strom_dma_task_locks[hindex];
+		slot = &strom_dma_task_slots[hindex];
+
+		spin_lock_irqsave(lock, flags);
+		list_for_each_entry(dtask, slot, chain)
 		{
 			if (dtask->dma_task_id == dma_task_id)
 			{
@@ -1253,11 +1283,8 @@ strom_memcpy_ssd2gpu_wait(unsigned int ntasks,
 				break;
 			}
 		}
-		spin_unlock_irqrestore(&strom_dma_task_locks[h_index], flags);
+		spin_unlock_irqrestore(lock, flags);
 	}
-
-	prDebug("End strom_memcpy_ssd2gpu_wait: w_index=%d ntasks=%u retval=%d",
-			w_index, ntasks, retval);
 
 	/* cleanup */
 	if (task_waitq != __task_waitq)
@@ -1265,7 +1292,7 @@ strom_memcpy_ssd2gpu_wait(unsigned int ntasks,
 	if (task_waitq_array != __task_waitq_array)
 		kfree(task_waitq_array);
 
-	return retval < 0 ? retval : w_index;
+	return (retval < 0 ? retval : w_index);
 }
 
 /*
@@ -1435,11 +1462,10 @@ do_ssd2gpu_async_memcpy(strom_dma_state *dstate)
  * strom_memcpy_ssd2gpu_async
  */
 static long
-strom_memcpy_ssd2gpu_async(unsigned long handle, int fdesc,
-						   int nchunks, strom_dma_chunk __user *uchunks,
-						   unsigned long *p_dma_task_id,
-						   long __user *p_user_status,	/* for async */
-						   long		   *p_kern_status)	/* for sync */
+strom_memcpy_ssd2gpu_async(StromCmd__MemCpySsdToGpu *karg,
+						   strom_dma_chunk __user *uchunks,
+						   struct file *ioctl_filp,
+						   unsigned long *p_dma_task_id)
 {
 	mapped_gpu_memory	   *mgmem;
 	strom_dma_task		   *dtask;
@@ -1453,11 +1479,11 @@ strom_memcpy_ssd2gpu_async(unsigned long handle, int fdesc,
 	long					retval = 0;
 
 	/* ensure the supplied file is supported */
-	filp = fget(fdesc);
+	filp = fget(karg->fdesc);
 	if (!filp)
 	{
 		prError("file descriptor %d of process %u is not available",
-				fdesc, current->tgid);
+				karg->fdesc, current->tgid);
 		return -EBADF;
 	}
 	retval = source_file_is_supported(filp, &nvme_ns);
@@ -1467,7 +1493,7 @@ strom_memcpy_ssd2gpu_async(unsigned long handle, int fdesc,
 	s_bdev = i_sb->s_bdev;
 
 	/* get destination GPU memory */
-	mgmem = strom_get_mapped_gpu_memory(handle);
+	mgmem = strom_get_mapped_gpu_memory(karg->handle);
 	if (!mgmem)
 	{
 		retval = -ENOENT;
@@ -1476,7 +1502,7 @@ strom_memcpy_ssd2gpu_async(unsigned long handle, int fdesc,
 
 	/* make strom_dma_task object */
 	dtask = kmalloc(offsetof(strom_dma_task,
-							 chunks[nchunks]), GFP_KERNEL);
+							 chunks[karg->nchunks]), GFP_KERNEL);
 	if (!dtask)
 	{
 		retval = -ENOMEM;
@@ -1490,40 +1516,15 @@ strom_memcpy_ssd2gpu_async(unsigned long handle, int fdesc,
 	dtask->mgmem		= mgmem;
 	init_waitqueue_head(&dtask->wait_tasks);
 	dtask->dma_chan		= NULL;	/* assign on demand */
-	dtask->nchunks		= nchunks;
+	dtask->nchunks		= karg->nchunks;
 	if (copy_from_user(dtask->chunks, uchunks,
-					   sizeof(strom_dma_chunk) * nchunks))
+					   sizeof(strom_dma_chunk) * karg->nchunks))
 	{
 		retval = -EFAULT;
 		goto error_3;
 	}
-
-	/* DMA error status */
-	if (p_kern_status)
-	{
-		Assert(!p_user_status);
-		dtask->p_kern_status = p_kern_status;
-		dtask->user_status_page = NULL;
-		dtask->user_status_offset = 0;
-	}
-	else if (p_user_status)
-	{
-		dtask->p_kern_status = NULL;
-
-		if (get_user_pages_fast((unsigned long)p_user_status, 1, 1,
-								&dtask->user_status_page) < 1)
-		{
-			retval = -ENOMEM;
-			goto error_3;
-		}
-		dtask->user_status_offset = (unsigned long)p_user_status & PAGE_MASK;
-	}
-	else
-	{
-		dtask->p_kern_status = NULL;
-		dtask->user_status_page = NULL;
-		dtask->user_status_offset = 0;
-	}
+	dtask->dma_status	= 0;
+	dtask->ioctl_filp	= get_file(ioctl_filp);
 
 	/* OK, this strom_dma_task can be tracked */
 	spin_lock_irqsave(&strom_dma_task_locks[dtask->hindex], flags);
@@ -1552,7 +1553,8 @@ strom_memcpy_ssd2gpu_async(unsigned long handle, int fdesc,
 	/* Synchronization of requests already submitted, if any error */
 	if (retval)
 	{
-		while (strom_memcpy_ssd2gpu_wait(1, 1, &dma_task_id) == -EINTR);
+		while (strom_memcpy_ssd2gpu_wait(1, 1, &dma_task_id,
+										 NULL, NULL) == -EINTR);
 	}
 	return retval;
 
@@ -1569,7 +1571,8 @@ error_1:
  * ioctl(2) handler for STROM_IOCTL__MEMCPY_SSD2GPU
  */
 static long
-strom_ioctl_memcpy_ssd2gpu(StromCmd__MemCpySsdToGpu __user *uarg)
+strom_ioctl_memcpy_ssd2gpu(StromCmd__MemCpySsdToGpu __user *uarg,
+						   struct file *ioctl_filp)
 {
 	StromCmd__MemCpySsdToGpu karg;
 	unsigned long	dma_task_id;
@@ -1580,15 +1583,14 @@ strom_ioctl_memcpy_ssd2gpu(StromCmd__MemCpySsdToGpu __user *uarg)
 					   offsetof(StromCmd__MemCpySsdToGpu, chunks)))
 		return -EFAULT;
 
-	retval = strom_memcpy_ssd2gpu_async(karg.handle, karg.fdesc,
-										karg.nchunks, uarg->chunks,
-										&dma_task_id,
-										NULL,
-										&dma_status);
+	retval = strom_memcpy_ssd2gpu_async(&karg, uarg->chunks, ioctl_filp,
+										&dma_task_id);
 	if (retval == 0)
 	{
 		do {
-			retval = strom_memcpy_ssd2gpu_wait(1, 1, &dma_task_id);
+			// return, even if EINVAL
+			retval = strom_memcpy_ssd2gpu_wait(1, 1, &dma_task_id,
+											   NULL, NULL);
 		} while (retval == -EINVAL);
 
 		if (retval == 0 && put_user(dma_status, &uarg->status))
@@ -1601,27 +1603,26 @@ strom_ioctl_memcpy_ssd2gpu(StromCmd__MemCpySsdToGpu __user *uarg)
  * ioctl(2) handler for STROM_IOCTL__MEMCPY_SSD2GPU_ASYNC
  */
 static long
-strom_ioctl_memcpy_ssd2gpu_async(StromCmd__MemCpySsdToGpuAsync __user *uarg)
+strom_ioctl_memcpy_ssd2gpu_async(StromCmd__MemCpySsdToGpu __user *uarg,
+								 struct file *ioctl_filp)
 {
-	StromCmd__MemCpySsdToGpuAsync karg;
+	StromCmd__MemCpySsdToGpu karg;
 	unsigned long	dma_task_id;
 	long			retval;
 
 	if (copy_from_user(&karg, uarg,
-					   offsetof(StromCmd__MemCpySsdToGpuAsync, chunks)))
+					   offsetof(StromCmd__MemCpySsdToGpu, chunks)))
 		return -EFAULT;
 
-	retval = strom_memcpy_ssd2gpu_async(karg.handle, karg.fdesc,
-										karg.nchunks, uarg->chunks,
-										&dma_task_id,
-										karg.p_status,
-										NULL);
+	retval = strom_memcpy_ssd2gpu_async(&karg, uarg->chunks, ioctl_filp,
+										&dma_task_id);
 	if (retval == 0)
 	{
 		if (put_user(dma_task_id, &uarg->dma_task_id))
 		{
 			do {
-				retval = strom_memcpy_ssd2gpu_wait(1, 1, &dma_task_id);
+				retval = strom_memcpy_ssd2gpu_wait(1, 1, &dma_task_id,
+												   NULL, NULL);
 			} while (retval == -EINVAL);
 			retval = -EFAULT;
 		}
@@ -1633,11 +1634,14 @@ strom_ioctl_memcpy_ssd2gpu_async(StromCmd__MemCpySsdToGpuAsync __user *uarg)
  * ioctl(2) handler for STROM_IOCTL__MEMCPY_SSD2GPU_WAIT
  */
 static int
-strom_ioctl_memcpy_ssd2gpu_wait(StromCmd__MemCpySsdToGpuWait __user *uarg)
+strom_ioctl_memcpy_ssd2gpu_wait(StromCmd__MemCpySsdToGpuWait __user *uarg,
+								struct file *ioctl_filp)
 {
 	StromCmd__MemCpySsdToGpuWait	__karg;
 	StromCmd__MemCpySsdToGpuWait   *karg;
-	int			retval;
+	unsigned long	failed_dma_task_id = 0;
+	long			failed_dma_status;
+	long			retval;
 
 	if (copy_from_user(&__karg, uarg,
 					   offsetof(StromCmd__MemCpySsdToGpuWait, dma_task_id)))
@@ -1668,17 +1672,40 @@ strom_ioctl_memcpy_ssd2gpu_wait(StromCmd__MemCpySsdToGpuWait __user *uarg)
 			return -EFAULT;
 		}
 	}
+
 	retval = strom_memcpy_ssd2gpu_wait(karg->ntasks,
 									   karg->nwaits,
-									   karg->dma_task_id);
+									   karg->dma_task_id,
+									   &failed_dma_task_id,
+									   &failed_dma_status);
 	if (retval >= 0)
 	{
 		karg->nwaits = retval;
-		if (copy_to_user(uarg, karg,
+		karg->status = 0;
+		if (retval > 0 &&
+			copy_to_user(uarg, karg,
 						 offsetof(StromCmd__MemCpySsdToGpuWait,
 								  dma_task_id[karg->nwaits])))
 			retval = -EFAULT;
 		retval = 0;
+	}
+	else
+	{
+		if (!failed_dma_task_id)
+		{
+			karg->nwaits = 0;
+			karg->status = 0;
+		}
+		else
+		{
+			karg->nwaits = 1;
+			karg->status = failed_dma_status;
+			karg->dma_task_id[0] = failed_dma_task_id;
+		}
+		if (copy_to_user(uarg, karg,
+						 offsetof(StromCmd__MemCpySsdToGpuWait,
+                                  dma_task_id[karg->nwaits])))
+			retval = -EFAULT;
 	}
 
 	if (karg != &__karg)
@@ -1688,206 +1715,31 @@ strom_ioctl_memcpy_ssd2gpu_wait(StromCmd__MemCpySsdToGpuWait __user *uarg)
 
 /* ================================================================
  *
- * For debug
- *
- * ================================================================
- */
-#include <linux/genhd.h>
-
-static int
-strom_ioctl_debug(StromCmd__Debug __user *uarg)
-{
-	StromCmd__Debug	karg;
-	struct file	   *filp;
-	struct inode   *inode;
-	struct page	   *page;
-	int				rc;
-	int				fs_type;
-	unsigned long	pos;
-	unsigned long	ofs;
-	unsigned long	end;
-
-	if (copy_from_user(&karg, uarg, sizeof(StromCmd__Debug)))
-		return -EFAULT;
-
-	filp = fget(karg.fdesc);
-	printk(KERN_INFO "filp = %p\n", filp);
-	if (!filp)
-		return 0;
-	inode = filp->f_inode;
-
-	fs_type = source_file_is_supported(filp, NULL);
-	if (fs_type < 0)
-	{
-		fput(filp);
-		return fs_type;
-	}
-	pos = karg.offset >> PAGE_CACHE_SHIFT;
-	ofs = karg.offset &  PAGE_MASK;
-	end = (karg.offset + karg.length) >> PAGE_CACHE_SHIFT;
-
-	while (pos < end)
-	{
-		page = find_get_page(filp->f_mapping, pos);
-		if (page)
-		{
-			printk(KERN_INFO "file index=%lu page %p\n", pos, page);
-			put_page(page);
-		}
-		else
-		{
-			struct buffer_head	bh;
-
-			memset(&bh, 0, sizeof(bh));
-			bh.b_size = PAGE_SIZE;
-
-			rc = strom_get_block(filp->f_inode, pos, &bh, 0);
-			if (rc < 0)
-				printk(KERN_INFO "failed on strom_get_block: %d\n", rc);
-			else
-			{
-				printk(KERN_INFO "file index=%lu blocknr=%lu\n",
-					   pos, bh.b_blocknr);
-			}
-		}
-		pos++;
-	}
-	fput(filp);
-
-	return 0;
-}
-
-/* ================================================================
- *
  * file_operations of '/proc/nvme-strom' entry
  *
  * ================================================================
  */
-typedef struct
-{
-	/* status of asynchronous task */
-	atomic64_t	dma_status;
-	/* contents of read(2) */
-	size_t		length;
-	size_t		usage;
-	char		data[1];
-} strom_proc_entry;
-
-static strom_proc_entry *
-strom_proc_printf(strom_proc_entry *spent, const char *fmt, ...)
-{
-	va_list	args;
-	int		count;
-	char	linebuf[200];
-
-	if (!spent)
-		return NULL;
-
-	va_start(args, fmt);
-	count = vsnprintf(linebuf, sizeof(linebuf), fmt, args);
-	va_end(args);
-
-	while (spent->usage + count > spent->length)
-	{
-		strom_proc_entry *spent_new;
-		size_t		length_new = 2 * spent->length;		
-
-		spent_new = __krealloc(spent, length_new, GFP_ATOMIC);
-		kfree(spent);
-		spent = spent_new;
-		if (!spent)
-			return NULL;
-		spent->length = length_new;
-	}
-	strcpy(spent->data + spent->usage, linebuf);
-	spent->usage += count;
-
-	return spent;
-}
+static const char  *strom_proc_signature =		\
+	"nvme_strom version " NVME_STROM_VERSION	\
+	" built for linux kernel " UTS_RELEASE;
 
 static int
 strom_proc_open(struct inode *inode, struct file *filp)
 {
-	strom_proc_entry   *spent;
-	int					i, j;
-
-	spent = kmalloc(PAGE_SIZE, GFP_KERNEL);
-	if (!spent)
-		return -ENOMEM;
-	atomic64_set(&spent->dma_status, 0);
-	spent->length = PAGE_SIZE - offsetof(strom_proc_entry, data);
-	spent->usage  = 0;
-
-	/* headline */
-	spent = strom_proc_printf(spent, "# NVM-Strom Mapped GPU Memory\n");
-
-	/* for each mapping */
-	for (i=0; i < MAPPED_GPU_MEMORY_NSLOTS; i++)
-	{
-		spinlock_t		   *lock = &strom_mgmem_locks[i];
-		struct list_head   *slot = &strom_mgmem_slots[i];
-		unsigned long		flags;
-		mapped_gpu_memory  *mgmem;
-
-		spin_lock_irqsave(lock, flags);
-		list_for_each_entry(mgmem, slot, chain)
-		{
-			nvidia_p2p_page_table_t *page_table = mgmem->page_table;
-
-			spent = strom_proc_printf(
-				spent,
-				"slot: %d\n"
-				"handle: %p\n"
-				"owner: %u\n"
-				"refcnt: %d\n"
-				"version: %u\n"
-				"page_size: %zu\n"
-				"entries: %u\n",
-				i,
-				(void *)mgmem->handle,
-				mgmem->owner,
-				mgmem->refcnt,
-				page_table->version,
-				mgmem->gpu_page_sz,
-				page_table->entries);
-
-			for (j=0; j < page_table->entries; j++)
-			{
-				spent = strom_proc_printf(
-					spent,
-					"PTE: V:%p <--> P:%p\n",
-					(void *)(mgmem->map_address + j * mgmem->gpu_page_sz),
-					(void *)(page_table->pages[j]->physical_address));
-			}
-			spent = strom_proc_printf(spent, "\n");
-		}
-		spin_unlock_irqrestore(lock, flags);
-	}
-
-	if (!spent)
-		return -ENOMEM;
-
-	filp->private_data = spent;
-
 	return 0;
 }
 
 static ssize_t
 strom_proc_read(struct file *filp, char __user *buf, size_t len, loff_t *pos)
 {
-	strom_proc_entry   *spent = filp->private_data;
+	size_t		sig_len = strlen(strom_proc_signature);
 
-	if (!spent)
-		return -EINVAL;
-
-	if (*pos >= spent->usage)
+	if (*pos >= sig_len)
 		return 0;
-	if (*pos + len >= spent->usage)
-		len = spent->usage - *pos;
-
-	if (copy_to_user(buf, spent->data + *pos, len))
+	if (*pos + len >= sig_len)
+		len = sig_len - *pos;
+	if (copy_to_user(buf, strom_proc_signature + *pos, len))
 		return -EFAULT;
-
 	*pos += len;
 
 	return len;
@@ -1896,10 +1748,30 @@ strom_proc_read(struct file *filp, char __user *buf, size_t len, loff_t *pos)
 static int
 strom_proc_release(struct inode *inode, struct file *filp)
 {
-	strom_proc_entry   *spent = filp->private_data;
+	int			i;
 
-	if (spent)
-		kfree(spent);
+	for (i=0; i < STROM_DMA_TASK_NSLOTS; i++)
+	{
+		spinlock_t		   *lock = &strom_dma_task_locks[i];
+		struct list_head   *slot = &failed_dma_task_slots[i];
+		unsigned long		flags;
+		strom_dma_task	   *dtask;
+		strom_dma_task	   *dnext;
+
+		spin_lock_irqsave(lock, flags);
+		list_for_each_entry_safe(dtask, dnext, slot, chain)
+		{
+			if (dtask->ioctl_filp == filp)
+			{
+				prNotice("Unreferenced asynchronous SSD2GPU DMA error "
+						 "(dma_task_id: %lu, status=%ld)",
+						 dtask->dma_task_id, dtask->dma_status);
+				list_del(&dtask->chain);
+				kfree(dtask);
+			}
+		}
+		spin_unlock_irqrestore(lock, flags);
+	}
 	return 0;
 }
 
@@ -1929,19 +1801,18 @@ strom_proc_ioctl(struct file *ioctl_filp,
 			break;
 
 		case STROM_IOCTL__MEMCPY_SSD2GPU:
-			retval = strom_ioctl_memcpy_ssd2gpu((void __user *) arg);
+			retval = strom_ioctl_memcpy_ssd2gpu((void __user *) arg,
+												ioctl_filp);
 			break;
 
 		case STROM_IOCTL__MEMCPY_SSD2GPU_ASYNC:
-			retval = strom_ioctl_memcpy_ssd2gpu_async((void __user *) arg);
+			retval = strom_ioctl_memcpy_ssd2gpu_async((void __user *) arg,
+													  ioctl_filp);
 			break;
 
 		case STROM_IOCTL__MEMCPY_SSD2GPU_WAIT:
-			retval = strom_ioctl_memcpy_ssd2gpu_wait((void __user *) arg);
-			break;
-
-		case STROM_IOCTL__DEBUG:
-			retval = strom_ioctl_debug((void __user *) arg);
+			retval = strom_ioctl_memcpy_ssd2gpu_wait((void __user *) arg,
+													 ioctl_filp);
 			break;
 
 		default:
@@ -1979,6 +1850,7 @@ int	__init nvme_strom_init(void)
 	{
 		spin_lock_init(&strom_dma_task_locks[i]);
 		INIT_LIST_HEAD(&strom_dma_task_slots[i]);
+		INIT_LIST_HEAD(&failed_dma_task_slots[i]);
 	}
 
 	/* make "/proc/nvme-strom" entry */

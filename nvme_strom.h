@@ -18,7 +18,6 @@ enum {
 	STROM_IOCTL__MEMCPY_SSD2GPU			= _IO('S',0x84),
 	STROM_IOCTL__MEMCPY_SSD2GPU_ASYNC	= _IO('S',0x85),
 	STROM_IOCTL__MEMCPY_SSD2GPU_WAIT	= _IO('S',0x86),
-	STROM_IOCTL__DEBUG					= _IO('S',0x87),
 };
 
 /* path of ioctl(2) entrypoint */
@@ -64,7 +63,7 @@ struct StromCmd__InfoGpuMemory
 };
 typedef struct StromCmd__InfoGpuMemory	StromCmd__InfoGpuMemory;
 
-/* STROM_IOCTL__MEMCPY_SSD2GPU */
+/* STROM_IOCTL__MEMCPY_SSD2GPU or STROM_IOCTL__MEMCPY_SSD2GPU_ASYNC */
 struct strom_dma_chunk
 {
 	loff_t			fpos;		/* in: position of the source file from 
@@ -77,41 +76,27 @@ typedef struct strom_dma_chunk	strom_dma_chunk;
 
 struct StromCmd__MemCpySsdToGpu
 {
-	long			status;		/* out: status of this DMA operation */
+	unsigned long	dma_task_id;/* out: ID of the DMA task (only async) */
+	long			status;		/* out: status of the DMA task (only sync) */
 	unsigned long	handle;		/* in: handler of the mapped GPU memory */
-	int				fdesc;		/* in: file descriptor, if any. Or, -1 */
+	int				fdesc;		/* in: descriptor of the source file */
 	int				nchunks;	/* in: number of the source chunks */
 	strom_dma_chunk	chunks[1];	/* in: ...variable length array... */
 };
 typedef struct StromCmd__MemCpySsdToGpu	StromCmd__MemCpySsdToGpu;
-
-/* STROM_IOCTL__MEMCPY_SSD2GPU_ASYNC */
-struct StromCmd__MemCpySsdToGpuAsync
-{
-	unsigned long	dma_task_id;/* out: identifier of the DMA task */
-	long		   *p_status;	/* in: pointer to the async DMA status field */
-	unsigned long	handle;		/* in: handler of the mapped GPU memory */
-	int				fdesc;		/* in: file descriptor, if any. Or, -1 */
-	int				nchunks;	/* in: number of the source chunks */
-	strom_dma_chunk	chunks[1];	/* in: ...variable length array... */
-};
-typedef struct StromCmd__MemCpySsdToGpuAsync StromCmd__MemCpySsdToGpuAsync;
 
 /* STROM_IOCTL__MEMCPY_SSD2GPU_WAIT */
 typedef struct
 {
 	unsigned int	ntasks;		/* in: length of the dma_task_id[] array */
 	unsigned int	nwaits;		/* in: Min number of DMA tasks to wait 
-								 * out: num of DMA tasks actually completed */
+								 * out: num of DMA tasks actually completed;
+								 *      it may be less than input @nwaits,
+								 *      if any DMA task made error status.
+								 */
+	long			status;		/* out: error code if any */
 	unsigned long	dma_task_id[1];	/* in: ID of the DMA tasks
 									 * out: ID of the completed DMA tasks */
 } StromCmd__MemCpySsdToGpuWait;
 
-/* STROM_IOCTL_DEBUG */
-typedef struct
-{
-	int				fdesc;		/* in: file descriptor */
-	unsigned long	offset;
-	unsigned long	length;
-} StromCmd__Debug;
 #endif /* NVME_STROM_H */
