@@ -7,7 +7,11 @@
  *
  *
  */
+#include <asm/cpufeature.h>
 #include <asm/uaccess.h>
+#ifdef CONFIG_X86_64
+#include <asm/i387.h>
+#endif
 #include <linux/async_tx.h>
 #include <linux/buffer_head.h>
 #include <linux/dmaengine.h>
@@ -105,12 +109,93 @@ MODULE_PARM_DESC(verbose, "turn on/off debug message");
 /* procfs entry of "/proc/nvme-strom" */
 static struct proc_dir_entry  *nvme_strom_proc = NULL;
 
+/*
+ * Fast memcpy implementation by AVX/SSE registers
+ */
+static void
+memcpy_simd(volatile void __iomem *__dst, const void *__src, size_t nbytes)
+{
+	volatile char __iomem *dst = __dst;
+	const char *src = __src;
+	size_t		unitsz;
 
+#ifdef CONFIG_X86_64
+	kernel_fpu_begin();
+	/*
+	 * Use of %ymm register needs 256-bits alignment
+	 */
+	if (cpu_has_avx &&
+		((uintptr_t)dst & 0x1f) == 0 && ((uintptr_t)src & 0x1f) == 0)
+	{
+		unitsz = 8 * 0x20;	/* 8x 256bits register */
 
+		while (nbytes >= unitsz)
+		{
+			/* read */
+			asm volatile("vmovdqa %0,%%ymm0" : : "m" (src[0x00]));
+			asm volatile("vmovdqa %0,%%ymm1" : : "m" (src[0x20]));
+			asm volatile("vmovdqa %0,%%ymm2" : : "m" (src[0x40]));
+			asm volatile("vmovdqa %0,%%ymm3" : : "m" (src[0x60]));
+			asm volatile("vmovdqa %0,%%ymm4" : : "m" (src[0x80]));
+			asm volatile("vmovdqa %0,%%ymm5" : : "m" (src[0xa0]));
+			asm volatile("vmovdqa %0,%%ymm6" : : "m" (src[0xc0]));
+			asm volatile("vmovdqa %0,%%ymm7" : : "m" (src[0xe0]));
 
+			/* write */
+			asm volatile("vmovdqa %%ymm0,%0" : : "m" (dst[0x00]));
+			asm volatile("vmovdqa %%ymm1,%0" : : "m" (dst[0x20]));
+			asm volatile("vmovdqa %%ymm2,%0" : : "m" (dst[0x40]));
+			asm volatile("vmovdqa %%ymm3,%0" : : "m" (dst[0x60]));
+			asm volatile("vmovdqa %%ymm4,%0" : : "m" (dst[0x80]));
+			asm volatile("vmovdqa %%ymm5,%0" : : "m" (dst[0xa0]));
+			asm volatile("vmovdqa %%ymm6,%0" : : "m" (dst[0xc0]));
+			asm volatile("vmovdqa %%ymm7,%0" : : "m" (dst[0xe0]));
 
+			dst += unitsz;
+			src += unitsz;
+			nbytes -= unitsz;
+		}
+	}
 
+	/*
+	 * Use of %xmm register needs 128bits alignment
+	 */
+	if (cpu_has_xmm &&
+		((uintptr_t)dst & 0x0f) == 0 && ((uintptr_t)src & 0x0f) == 0)
+	{
+		unitsz = 8 * 0x10;	/* 8x 128bits register */
 
+		while (nbytes >= unitsz)
+		{
+			/* read */
+			asm volatile("movdqa %0,%%xmm0" : : "m" (src[0x00]));
+			asm volatile("movdqa %0,%%xmm1" : : "m" (src[0x10]));
+			asm volatile("movdqa %0,%%xmm2" : : "m" (src[0x20]));
+			asm volatile("movdqa %0,%%xmm3" : : "m" (src[0x30]));
+			asm volatile("movdqa %0,%%xmm4" : : "m" (src[0x40]));
+			asm volatile("movdqa %0,%%xmm5" : : "m" (src[0x50]));
+			asm volatile("movdqa %0,%%xmm6" : : "m" (src[0x60]));
+			asm volatile("movdqa %0,%%xmm7" : : "m" (src[0x70]));
+
+			/* write */
+			asm volatile("movdqa %%xmm0,%0" : : "m" (dst[0x00]));
+			asm volatile("movdqa %%xmm1,%0" : : "m" (dst[0x10]));
+			asm volatile("movdqa %%xmm2,%0" : : "m" (dst[0x20]));
+			asm volatile("movdqa %%xmm3,%0" : : "m" (dst[0x30]));
+			asm volatile("movdqa %%xmm4,%0" : : "m" (dst[0x40]));
+			asm volatile("movdqa %%xmm5,%0" : : "m" (dst[0x50]));
+			asm volatile("movdqa %%xmm6,%0" : : "m" (dst[0x60]));
+			asm volatile("movdqa %%xmm7,%0" : : "m" (dst[0x70]));
+
+			dst += unitsz;
+			src += unitsz;
+			nbytes -= unitsz;
+		}
+	}
+	kernel_fpu_end();
+#endif
+	memcpy_toio(dst, src, nbytes);
+}
 
 /*
  * ================================================================
@@ -1005,7 +1090,7 @@ retry:
 	/* map source RAM page, and memcpy by CPU */
 	src_buffer = kmap_atomic(fpage);
 	dst_buffer = dstate->dest_iomap + (dest_offset & (mgmem->gpu_page_sz - 1));
-	memcpy_toio(dst_buffer, src_buffer + page_ofs, dma_len);
+	memcpy_simd(dst_buffer, src_buffer + page_ofs, dma_len);
 	__kunmap_atomic(src_buffer);
 
 	page_len -= dma_len;
