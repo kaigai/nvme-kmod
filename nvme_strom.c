@@ -1459,7 +1459,17 @@ do_ssd2gpu_async_memcpy(strom_dma_state *dstate)
 				   (page_len & (dstate->blocksz - 1)) == 0);
 
 			fpage = find_get_page(filp->f_mapping, pos >> PAGE_CACHE_SHIFT);
-			if (fpage && !PageUptodate(fpage))
+			/*
+			 * NOTE: Theoretical performance of RAM-to-GPU transfer should
+			 * be faster than SSD-to-GPU, however, we cannot use DMA engine
+			 * of GPU device, thus, we have to map PCI BAR region with
+			 * ioremap() then copy values by CPU.
+			 * It tends to use unreasonably small packet even if SSE/AVX
+			 * registers are used.
+			 * So, as a workaround, RAM-to-GPU transfer shall be applied
+			 * only when the cached page is dirty.
+			 */
+			if (fpage && PageDirty(fpage))
 			{
 				/* Submit SSD2GPU DMA, if any pending request */
 				if (dstate->nr_blocks > 0)
