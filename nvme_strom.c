@@ -1138,6 +1138,8 @@ nvme_alloc_iod(unsigned int nsegs, size_t nbytes,
 		iod->nents = 0;
 		iod->first_dma = 0ULL;
 	}
+	sg_init_table(iod->sg, nsegs);
+
 	return iod;
 }
 
@@ -1150,10 +1152,10 @@ submit_ssd2gpu_memcpy(strom_dma_state *dstate)
 	struct nvme_ns	   *nvme_ns = dstate->nvme_ns;
 	struct nvme_dev	   *nvme_dev = nvme_ns->dev;
 	struct nvme_iod	   *iod;
-	struct scatterlist *sg;
 	size_t				offset;
 	size_t				total_nbytes;
 	dma_addr_t			base_addr;
+	int					length;
 	int					i, base;
 	int					retval;
 
@@ -1172,9 +1174,6 @@ submit_ssd2gpu_memcpy(strom_dma_state *dstate)
 	if (!iod)
 		return -ENOMEM;
 
-	sg = iod->sg;
-	sg_init_table(sg, page_table->entries);
-
 	base = (dstate->dest_offset >> mgmem->gpu_page_shift);
 	offset = (dstate->dest_offset & (mgmem->gpu_page_sz - 1));
 	prDebug("base=%d offset=%zu dest_offset=%zu total_nbytes=%zu",
@@ -1185,14 +1184,15 @@ submit_ssd2gpu_memcpy(strom_dma_state *dstate)
 			break;
 
 		base_addr = page_table->pages[base + i]->physical_address;
-		sg[i].page_link = 0;
-		sg[i].dma_address = base_addr + offset;
-		sg[i].length = Min(total_nbytes, mgmem->gpu_page_sz - offset);
-		sg[i].dma_length = sg[i].length;
-		sg[i].offset = 0;
+		length = Min(total_nbytes, mgmem->gpu_page_sz - offset);
+		iod->sg[i].page_link = 0;
+		iod->sg[i].dma_address = base_addr + offset;
+		iod->sg[i].length = length;
+		iod->sg[i].dma_length = length;
+		iod->sg[i].offset = 0;
 
 		offset = 0;
-		total_nbytes -= sg[i].length;
+		total_nbytes -= length;
 	}
 
 	if (total_nbytes)
@@ -1200,7 +1200,7 @@ submit_ssd2gpu_memcpy(strom_dma_state *dstate)
 		__nvme_free_iod(nvme_dev, iod);
 		return -EINVAL;
 	}
-	sg_mark_end(&sg[i]);
+	sg_mark_end(&iod->sg[i]);
 	iod->nents = i;
 
 	retval = nvme_submit_async_read_cmd(dstate, iod);
