@@ -1112,10 +1112,12 @@ retry:
 
 /* alternative of the core nvme_alloc_iod */
 static struct nvme_iod *
-nvme_alloc_iod(unsigned int nsegs, size_t nbytes,
+nvme_alloc_iod(size_t nbytes,
+			   mapped_gpu_memory *mgmem,
 			   struct nvme_dev *dev, gfp_t gfp)
 {
 	struct nvme_iod *iod;
+	unsigned int	nsegs;
 	unsigned int	nprps;
 	unsigned int	npages;
 
@@ -1124,6 +1126,7 @@ nvme_alloc_iod(unsigned int nsegs, size_t nbytes,
 	 * as it only leads to a small amount of wasted memory for the lifetime of
 	 * the I/O.
 	 */
+	nsegs = DIV_ROUND_UP(nbytes + mgmem->gpu_page_sz, mgmem->gpu_page_sz);
 	nprps = DIV_ROUND_UP(nbytes + dev->page_size, dev->page_size);
 	npages = DIV_ROUND_UP(8 * nprps, dev->page_size - 8);
 
@@ -1167,8 +1170,8 @@ submit_ssd2gpu_memcpy(strom_dma_state *dstate)
 											  mgmem->map_length))
 		return -ERANGE;
 
-	iod = nvme_alloc_iod(page_table->entries,
-						 total_nbytes,
+	iod = nvme_alloc_iod(total_nbytes,
+						 mgmem,
 						 nvme_dev,
 						 GFP_KERNEL);
 	if (!iod)
