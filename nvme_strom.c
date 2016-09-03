@@ -209,7 +209,8 @@ struct mapped_gpu_memory
 	struct list_head	chain;		/* chain to the strom_mgmem_slots[] */
 	int					hindex;		/* index of the hash slot */
 	int					refcnt;		/* number of the concurrent tasks */
-	pid_t				owner;		/* PID who mapped this device memory */
+	kuid_t				owner;		/* effective user-id who mapped this
+									 * device memory */
 	unsigned long		handle;		/* identifier of this entry */
 	unsigned long		map_address;/* virtual address of the device memory
 									 * (note: just for message output) */
@@ -276,7 +277,7 @@ strom_get_mapped_gpu_memory(unsigned long handle)
 	list_for_each_entry(mgmem, slot, chain)
 	{
 		if (mgmem->handle == handle &&
-			mgmem->owner  == current->tgid)
+			uid_eq(mgmem->owner, current_euid()))
 		{
 			/* sanity checks */
 			Assert((unsigned long)mgmem == handle);
@@ -314,6 +315,7 @@ strom_put_mapped_gpu_memory(mapped_gpu_memory *mgmem)
 			wake_up_process(mgmem->wait_task);
 			mgmem->wait_task = NULL;
 		}
+		module_put(THIS_MODULE);
 	}
 	spin_unlock_irqrestore(lock, flags);
 }
@@ -377,7 +379,7 @@ callback_release_mapped_gpu_memory(void *private)
 				handle, rc);
 	kfree(mgmem);
 
-	prInfo("P2P GPU Memory (handle=%p) was released", (void *)handle);
+	prNotice("P2P GPU Memory (handle=%p) was released", (void *)handle);
 }
 
 /*
@@ -411,7 +413,7 @@ strom_ioctl_map_gpu_memory(StromCmd__MapGpuMemory __user *uarg)
 	INIT_LIST_HEAD(&mgmem->chain);
 	mgmem->hindex		= strom_mapped_gpu_memory_index(handle);
 	mgmem->refcnt		= 0;
-	mgmem->owner		= current->tgid;
+	mgmem->owner		= current_euid();
 	mgmem->handle		= handle;
 	mgmem->map_address  = map_address;
 	mgmem->map_offset	= map_offset;
@@ -462,26 +464,13 @@ strom_ioctl_map_gpu_memory(StromCmd__MapGpuMemory __user *uarg)
 		goto error_2;
 	}
 
-#if 0
-	/* Debug Output */
-	{
-		nvidia_p2p_page_table_t *page_table = mgmem->page_table;
-		int			i;
+	prNotice("P2P GPU Memory (handle=%p) mapped "
+			 "(version=%u, page_size=%zu, entries=%u)",
+			 (void *)mgmem->handle,
+			 mgmem->page_table->version,
+			 mgmem->gpu_page_sz,
+			 mgmem->page_table->entries);
 
-		prNotice("P2P GPU Memory (handle=%p) mapped "
-				 "(version=%u, page_size=%zu, entries=%u)",
-				 (void *)mgmem->handle,
-				 page_table->version,
-				 mgmem->gpu_page_sz,
-				 page_table->entries);
-		for (i=0; i < page_table->entries; i++)
-		{
-			prNotice("  V:%p <--> P:%p",
-					 (void *)(mgmem->map_address + i * mgmem->gpu_page_sz),
-					 (void *)(page_table->pages[i]->physical_address));
-		}
-	}
-#endif
 	/*
 	 * Warning message if mapped device memory is not aligned well
 	 */
@@ -495,6 +484,7 @@ strom_ioctl_map_gpu_memory(StromCmd__MapGpuMemory __user *uarg)
 			   mgmem->map_offset,
 			   mgmem->map_length);
 	}
+	__module_get(THIS_MODULE);
 
 	/* attach this mapped_gpu_memory */
 	spin_lock_irqsave(&strom_mgmem_locks[mgmem->hindex], flags);
@@ -542,7 +532,7 @@ strom_ioctl_unmap_gpu_memory(StromCmd__UnmapGpuMemory __user *uarg)
 		 * So, this behavior may be changed in the later version.
 		 */
 		if (mgmem->handle == karg.handle &&
-			mgmem->owner  == current->tgid)
+			uid_eq(mgmem->owner, current_euid()))
 		{
 			list_del(&mgmem->chain);
 			memset(&mgmem->chain, 0, sizeof(struct list_head));
