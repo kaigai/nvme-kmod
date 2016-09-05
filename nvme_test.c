@@ -367,11 +367,14 @@ exec_test_by_strom(CUdeviceptr cuda_devptr, unsigned long handle,
 		cuda_exit_on_error(rc, "cuStreamAddCallback");
 
 		/* kick GPU-to-RAM DMA */
-		rc = cuMemcpyDtoHAsync(atask->dest_buffer,
-							   cuda_devptr + atask->index * chunk_size,
-							   chunk_size,
-							   atask->cuda_stream);
-		cuda_exit_on_error(rc, "cuMemcpyDtoHAsync");
+		if (enable_checks)
+		{
+			rc = cuMemcpyDtoHAsync(atask->dest_buffer,
+								   cuda_devptr + atask->index * chunk_size,
+								   chunk_size,
+								   atask->cuda_stream);
+			cuda_exit_on_error(rc, "cuMemcpyDtoHAsync");
+		}
 
 		/* kick callback to release atask */
 		rc = cuStreamAddCallback(atask->cuda_stream,
@@ -452,12 +455,14 @@ exec_test_by_vfs(CUdeviceptr cuda_devptr, unsigned long handle,
 		cuda_exit_on_error(rc, "cuMemcpyHtoDAsync");
 
 		/* Kick GPU-to-RAM DMA */
-		rc = cuMemcpyDtoHAsync(atask->dest_buffer,
-							   cuda_devptr + atask->index * chunk_size,
-							   retval,
-							   atask->cuda_stream);
-		cuda_exit_on_error(rc, "cuMemcpyDtoHAsync");
-
+		if (enable_checks)
+		{
+			rc = cuMemcpyDtoHAsync(atask->dest_buffer,
+								   cuda_devptr + atask->index * chunk_size,
+								   retval,
+								   atask->cuda_stream);
+			cuda_exit_on_error(rc, "cuMemcpyDtoHAsync");
+		}
 		/* Kick callback to release atask */
 		rc = cuStreamAddCallback(atask->cuda_stream,
 								 callback_release_atask, atask, 0);
