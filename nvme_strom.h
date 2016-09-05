@@ -14,10 +14,11 @@ enum {
 	STROM_IOCTL__CHECK_FILE				= _IO('S',0x80),
 	STROM_IOCTL__MAP_GPU_MEMORY			= _IO('S',0x81),
 	STROM_IOCTL__UNMAP_GPU_MEMORY		= _IO('S',0x82),
-	STROM_IOCTL__INFO_GPU_MEMORY		= _IO('S',0x83),
-	STROM_IOCTL__MEMCPY_SSD2GPU			= _IO('S',0x84),
-	STROM_IOCTL__MEMCPY_SSD2GPU_ASYNC	= _IO('S',0x85),
-	STROM_IOCTL__MEMCPY_SSD2GPU_WAIT	= _IO('S',0x86),
+	STROM_IOCTL__LIST_GPU_MEMORY		= _IO('S',0x83),
+	STROM_IOCTL__INFO_GPU_MEMORY		= _IO('S',0x84),
+	STROM_IOCTL__MEMCPY_SSD2GPU			= _IO('S',0x85),
+	STROM_IOCTL__MEMCPY_SSD2GPU_ASYNC	= _IO('S',0x86),
+	STROM_IOCTL__MEMCPY_SSD2GPU_WAIT	= _IO('S',0x87),
 };
 
 /* path of ioctl(2) entrypoint */
@@ -47,6 +48,15 @@ struct StromCmd__UnmapGpuMemory
 	unsigned long	handle;		/* in: handler of the mapped region */
 };
 typedef struct StromCmd__UnmapGpuMemory	StromCmd__UnmapGpuMemory;
+
+/* STROM_IOCTL__LIST_GPU_MEMORY */
+struct StromCmd__ListGpuMemory
+{
+	uint32_t		nrooms;		/* in: length of the @handles array */
+	uint32_t		nitems;		/* out: number of mapped region */
+	unsigned long	handles[1];	/* out: array of mapped region handles */
+};
+typedef struct StromCmd__ListGpuMemory	StromCmd__ListGpuMemory;
 
 /* STROM_IOCTL__INFO_GPU_MEMORY */
 struct StromCmd__InfoGpuMemory

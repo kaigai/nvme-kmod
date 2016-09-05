@@ -12,6 +12,7 @@
  * as published by the Free Software Foundation.
  * ----------------------------------------------------------------
  */
+#include <errno.h>
 #include <fcntl.h>
 #include <libgen.h>
 #include <pthread.h>
@@ -39,6 +40,7 @@ static int		enable_checks = 0;
 static int		print_mapping = 0;
 static int		test_by_vfs = 0;
 static size_t	vfs_io_size = 0;
+static int		dump_iomem = 0;
 
 static sem_t	buffer_sem;
 static pthread_mutex_t	buffer_lock;
@@ -488,7 +490,64 @@ exec_test_by_vfs(CUdeviceptr cuda_devptr, unsigned long handle,
 }
 
 /*
- *
+ * exec_dump_iomem
+ */
+static int exec_dump_iomem(void)
+{
+	StromCmd__ListGpuMemory *cmd_list;
+	StromCmd__InfoGpuMemory	*cmd_info;
+	uint32_t		try_nrooms = 2000;
+	int				i, j;
+
+retry_list:
+	cmd_list = malloc(offsetof(StromCmd__ListGpuMemory,
+							   handles[try_nrooms]));
+	system_exit_on_error(-ENOMEM, "malloc");
+
+	cmd_list->nrooms = 100;
+	cmd_list->nitems = 0;
+	if (nvme_strom_ioctl(STROM_IOCTL__LIST_GPU_MEMORY, cmd_list))
+	{
+		if (errno == ENOBUFS)
+		{
+			free(cmd_list);
+			try_nrooms = cmd_list->nitems + 100;
+			goto retry_list;
+		}
+		system_exit_on_error(errno, "STROM_IOCTL__LIST_GPU_MEMORY");
+	}
+
+	i = 0;
+retry_info:
+	cmd_info = malloc(offsetof(StromCmd__InfoGpuMemory,
+							   pages[try_nrooms]));
+	system_exit_on_error(-ENOMEM, "malloc");
+	while (i < cmd_list->nitems)
+	{
+		cmd_info->handle = cmd_list->handles[i];
+		cmd_info->nrooms = try_nrooms;
+		if (nvme_strom_ioctl(STROM_IOCTL__INFO_GPU_MEMORY, cmd_info))
+		{
+			if (errno == ENOBUFS)
+			{
+				free(cmd_info);
+				try_nrooms = cmd_list->nitems + 100;
+				goto retry_info;
+			}
+			system_exit_on_error(errno, "STROM_IOCTL__INFO_GPU_MEMORY");
+		}
+		else
+		{
+			printf("* GPU mapped mamory (handle: 0x%lx)\n",
+				   cmd_list->handles[i]);
+		}
+		i++;
+	}
+	return 0;
+}
+
+/*
+ * usage
  */
 static void usage(const char *cmdname)
 {
@@ -499,7 +558,8 @@ static void usage(const char *cmdname)
 			"    -s <size of chunk in MB>: (default 32MB)\n"
 			"    -c : Enables corruption check (default off)\n"
 			"    -h : Print this message (default off)\n"
-			"    -f (i/o size in KB): Test by VFS access (default off)\n",
+			"    -f (i/o size in KB): Test by VFS access (default off)\n"
+			"    -i : Dump the current device memory mapping, with no test\n",
 			basename(strdup(cmdname)));
 	exit(1);
 }
@@ -521,7 +581,7 @@ int main(int argc, char * const argv[])
 	unsigned long	mgmem_handle;
 	int				code;
 
-	while ((code = getopt(argc, argv, "d:n:s:cpf::h")) >= 0)
+	while ((code = getopt(argc, argv, "d:n:s:cpf::ih")) >= 0)
 	{
 		switch (code)
 		{
@@ -545,6 +605,9 @@ int main(int argc, char * const argv[])
 				if (optarg)
 					vfs_io_size = (size_t)atoi(optarg) << 10;
 				break;
+			case 'i':
+				dump_iomem = 1;
+				break;
 			case 'h':
 			default:
 				usage(argv[0]);
@@ -552,6 +615,9 @@ int main(int argc, char * const argv[])
 		}
 	}
 	buffer_size = (size_t)chunk_size * num_chunks;
+
+	if (dump_iomem)
+		return exec_dump_iomem();
 
 	if (optind + 1 == argc)
 		filename = argv[optind];

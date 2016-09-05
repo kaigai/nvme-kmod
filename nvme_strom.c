@@ -553,6 +553,63 @@ strom_ioctl_unmap_gpu_memory(StromCmd__UnmapGpuMemory __user *uarg)
 }
 
 /*
+ * strom_ioctl_list_gpu_memory
+ *
+ * ioctl(2) handler for STROM_IOCTL__LIST_GPU_MEMORY
+ */
+static int
+strom_ioctl_list_gpu_memory(StromCmd__ListGpuMemory __user *uarg)
+{
+	StromCmd__ListGpuMemory karg;
+	unsigned long	   *handles;
+	spinlock_t		   *lock;
+	struct list_head   *slot;
+	unsigned long		flags;
+	mapped_gpu_memory  *mgmem;
+	int					i, j;
+	int					retval = 0;
+
+	if (copy_from_user(&karg, uarg,
+					   offsetof(StromCmd__ListGpuMemory, handles)))
+		return -EFAULT;
+
+	handles = kmalloc(offsetof(StromCmd__ListGpuMemory,
+							   handles[karg.nrooms]), GFP_KERNEL);
+	if (!handles)
+		return -ENOMEM;
+
+	karg.nitems = 0;
+	for (i=0; i < MAPPED_GPU_MEMORY_NSLOTS; i++)
+	{
+		lock = &strom_mgmem_locks[i];
+		slot = &strom_mgmem_slots[i];
+
+		spin_lock_irqsave(lock, flags);
+		list_for_each_entry(mgmem, slot, chain)
+		{
+			j = karg.nitems++;
+			if (j < karg.nrooms)
+				handles[j] = mgmem->handle;
+			else
+				retval = -ENOBUFS;
+		}
+		spin_unlock_irqrestore(lock, flags);
+	}
+	/* write hack the result */
+	if (copy_to_user(uarg, &karg,
+					 offsetof(StromCmd__ListGpuMemory, handles)) ||
+		copy_to_user(uarg->handles, handles,
+					 sizeof(unsigned long) * karg.nitems))
+	{
+		kfree(handles);
+		return -EFAULT;
+	}
+	/* OK */
+	kfree(handles);
+	return retval;
+}
+
+/*
  * strom_ioctl_info_gpu_memory
  *
  * ioctl(2) handler for STROM_IOCTL__INFO_GPU_MEMORY
@@ -583,7 +640,10 @@ strom_ioctl_info_gpu_memory(StromCmd__InfoGpuMemory __user *uarg)
 	for (i=0; i < page_table->entries; i++)
 	{
 		if (i >= karg.nrooms)
+		{
+			rc = -ENOBUFS;
 			break;
+		}
 		if (put_user((void *)(mgmem->map_address + i * mgmem->gpu_page_sz),
 					 &uarg->pages[i].vaddr) ||
 			put_user(page_table->pages[i]->physical_address,
@@ -1882,6 +1942,10 @@ strom_proc_ioctl(struct file *ioctl_filp,
 
 		case STROM_IOCTL__UNMAP_GPU_MEMORY:
 			retval = strom_ioctl_unmap_gpu_memory((void __user *) arg);
+			break;
+
+		case STROM_IOCTL__LIST_GPU_MEMORY:
+			retval = strom_ioctl_list_gpu_memory((void __user *) arg);
 			break;
 
 		case STROM_IOCTL__INFO_GPU_MEMORY:
