@@ -562,7 +562,6 @@ static int
 strom_ioctl_list_gpu_memory(StromCmd__ListGpuMemory __user *uarg)
 {
 	StromCmd__ListGpuMemory karg;
-	unsigned long	   *handles;
 	spinlock_t		   *lock;
 	struct list_head   *slot;
 	unsigned long		flags;
@@ -573,11 +572,6 @@ strom_ioctl_list_gpu_memory(StromCmd__ListGpuMemory __user *uarg)
 	if (copy_from_user(&karg, uarg,
 					   offsetof(StromCmd__ListGpuMemory, handles)))
 		return -EFAULT;
-
-	handles = kmalloc(offsetof(StromCmd__ListGpuMemory,
-							   handles[karg.nrooms]), GFP_KERNEL);
-	if (!handles)
-		return -ENOMEM;
 
 	karg.nitems = 0;
 	for (i=0; i < MAPPED_GPU_MEMORY_NSLOTS; i++)
@@ -590,23 +584,20 @@ strom_ioctl_list_gpu_memory(StromCmd__ListGpuMemory __user *uarg)
 		{
 			j = karg.nitems++;
 			if (j < karg.nrooms)
-				handles[j] = mgmem->handle;
+			{
+				if (put_user(mgmem->handle, &uarg->handles[j]))
+					retval = -EFAULT;
+			}
 			else
 				retval = -ENOBUFS;
 		}
 		spin_unlock_irqrestore(lock, flags);
 	}
-	/* write hack the result */
+	/* write back */
 	if (copy_to_user(uarg, &karg,
-					 offsetof(StromCmd__ListGpuMemory, handles)) ||
-		copy_to_user(uarg->handles, handles,
-					 sizeof(unsigned long) * karg.nitems))
-	{
-		kfree(handles);
-		return -EFAULT;
-	}
-	/* OK */
-	kfree(handles);
+					 offsetof(StromCmd__ListGpuMemory, handles)))
+		retval = -EFAULT;
+
 	return retval;
 }
 
@@ -624,7 +615,7 @@ strom_ioctl_info_gpu_memory(StromCmd__InfoGpuMemory __user *uarg)
 	size_t		length;
 	int			i, rc = 0;
 
-	length = offsetof(StromCmd__InfoGpuMemory, pages);
+	length = offsetof(StromCmd__InfoGpuMemory, paddrs);
 	if (copy_from_user(&karg, uarg, length))
 		return -EFAULT;
 
@@ -632,26 +623,30 @@ strom_ioctl_info_gpu_memory(StromCmd__InfoGpuMemory __user *uarg)
 	if (!mgmem)
 		return -ENOENT;
 
-	page_table = mgmem->page_table;
-	karg.version = page_table->version;
+	page_table       = mgmem->page_table;
+	karg.nitems      = page_table->entries;
+	karg.version     = page_table->version;
 	karg.gpu_page_sz = mgmem->gpu_page_sz;
-	karg.nitems = page_table->entries;
+	karg.owner       = __kuid_val(mgmem->owner);
+	karg.map_offset  = mgmem->map_offset;
+	karg.map_length  = mgmem->map_length;
 	if (copy_to_user((void __user *)uarg, &karg, length))
 		rc = -EFAULT;
-	for (i=0; i < page_table->entries; i++)
+	else
 	{
-		if (i >= karg.nrooms)
+		for (i=0; i < page_table->entries; i++)
 		{
-			rc = -ENOBUFS;
-			break;
-		}
-		if (put_user((void *)(mgmem->map_address + i * mgmem->gpu_page_sz),
-					 &uarg->pages[i].vaddr) ||
-			put_user(page_table->pages[i]->physical_address,
-					 &uarg->pages[i].paddr))
-		{
-			rc = -EFAULT;
-			break;
+			if (i >= karg.nrooms)
+			{
+				rc = -ENOBUFS;
+				break;
+			}
+			if (put_user(page_table->pages[i]->physical_address,
+						 &uarg->paddrs[i]))
+			{
+				rc = -EFAULT;
+				break;
+			}
 		}
 	}
 	strom_put_mapped_gpu_memory(mgmem);

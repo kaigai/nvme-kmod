@@ -12,6 +12,7 @@
  * as published by the Free Software Foundation.
  * ----------------------------------------------------------------
  */
+#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <libgen.h>
@@ -40,7 +41,6 @@ static int		enable_checks = 0;
 static int		print_mapping = 0;
 static int		test_by_vfs = 0;
 static size_t	vfs_io_size = 0;
-static int		dump_iomem = 0;
 
 static sem_t	buffer_sem;
 static pthread_mutex_t	buffer_lock;
@@ -126,44 +126,6 @@ ioctl_map_gpu_memory(CUdeviceptr cuda_devptr, size_t buffer_size)
 		exit(1);
 	}
 	return uarg.handle;
-}
-
-static void
-ioctl_info_gpu_memory(unsigned long handle, unsigned int num_pages)
-{
-	StromCmd__InfoGpuMemory *uarg;
-	size_t	required;
-	int		i, retval;
-
-	required = offsetof(StromCmd__InfoGpuMemory, pages[num_pages]);
-	uarg = malloc(required);
-	if (!uarg)
-	{
-		fprintf(stderr, "out of memory: %m\n");
-		exit(1);
-	}
-	memset(uarg, 0, required);
-	uarg->handle = handle;
-	uarg->nrooms = num_pages;
-
-	retval = nvme_strom_ioctl(STROM_IOCTL__INFO_GPU_MEMORY, uarg);
-	if (retval)
-	{
-		fprintf(stderr,
-				"STROM_IOCTL__INFO_GPU_MEMORY(handle=%lx) --> %d: %m\n",
-				handle, retval);
-		exit(1);
-	}
-
-	printf("Handle=%lx version=%u gpu_page_sz=%u\n",
-		   handle, uarg->version, uarg->gpu_page_sz);
-	for (i=0; i < uarg->nitems; i++)
-	{
-		printf("V:%016lx <--> P:%016lx\n",
-			   (unsigned long)uarg->pages[i].vaddr,
-			   (unsigned long)uarg->pages[i].paddr);
-	}
-	free(uarg);
 }
 
 typedef struct
@@ -490,56 +452,83 @@ exec_test_by_vfs(CUdeviceptr cuda_devptr, unsigned long handle,
 }
 
 /*
- * exec_dump_iomem
+ * ioctl_print_gpu_memory
  */
-static int exec_dump_iomem(void)
+static int ioctl_print_gpu_memory(void)
 {
 	StromCmd__ListGpuMemory *cmd_list;
 	StromCmd__InfoGpuMemory	*cmd_info;
-	uint32_t		try_nrooms = 2000;
+	uint32_t		nrooms = 2000;
 	int				i, j;
 
-retry_list:
-	cmd_list = malloc(offsetof(StromCmd__ListGpuMemory,
-							   handles[try_nrooms]));
-	system_exit_on_error(-ENOMEM, "malloc");
-
-	cmd_list->nrooms = 100;
-	cmd_list->nitems = 0;
-	if (nvme_strom_ioctl(STROM_IOCTL__LIST_GPU_MEMORY, cmd_list))
-	{
-		if (errno == ENOBUFS)
+	/* get list of mapped memory handles */
+	do {
+		cmd_list = malloc(offsetof(StromCmd__ListGpuMemory,
+								   handles[nrooms]));
+		system_exit_on_error(!cmd_list, "malloc");
+		cmd_list->nrooms = nrooms;
+		cmd_list->nitems = 0;
+		if (nvme_strom_ioctl(STROM_IOCTL__LIST_GPU_MEMORY, cmd_list))
 		{
+			if (errno != ENOBUFS)
+				system_exit_on_error(errno, "STROM_IOCTL__LIST_GPU_MEMORY");
+			assert(cmd_list->nitems > cmd_list->nrooms);
+			nrooms = cmd_list->nitems + 100;	/* with some margin */
 			free(cmd_list);
-			try_nrooms = cmd_list->nitems + 100;
-			goto retry_list;
 		}
-		system_exit_on_error(errno, "STROM_IOCTL__LIST_GPU_MEMORY");
-	}
+	} while (errno != 0);
 
-	i = 0;
-retry_info:
+	/* get property for each mapped device memory */
 	cmd_info = malloc(offsetof(StromCmd__InfoGpuMemory,
-							   pages[try_nrooms]));
-	system_exit_on_error(-ENOMEM, "malloc");
+							   paddrs[nrooms]));
+	system_exit_on_error(!cmd_info, "malloc");
+	i = 0;
 	while (i < cmd_list->nitems)
 	{
 		cmd_info->handle = cmd_list->handles[i];
-		cmd_info->nrooms = try_nrooms;
+		cmd_info->nrooms = nrooms;
+
 		if (nvme_strom_ioctl(STROM_IOCTL__INFO_GPU_MEMORY, cmd_info))
 		{
-			if (errno == ENOBUFS)
+			if (errno == ENOENT)
 			{
-				free(cmd_info);
-				try_nrooms = cmd_list->nitems + 100;
-				goto retry_info;
+				i++;
+				continue;
 			}
-			system_exit_on_error(errno, "STROM_IOCTL__INFO_GPU_MEMORY");
+			else if (errno != ENOBUFS)
+				system_exit_on_error(errno, "STROM_IOCTL__INFO_GPU_MEMORY");
+			assert(cmd_info->nitems > nrooms);
+			nrooms = cmd_info->nitems + 100;
+			free(cmd_info);
+			cmd_info = malloc(offsetof(StromCmd__InfoGpuMemory,
+									   paddrs[nrooms]));
+			system_exit_on_error(!cmd_info, "malloc");
+			continue;
 		}
 		else
 		{
-			printf("* GPU mapped mamory (handle: 0x%lx)\n",
-				   cmd_list->handles[i]);
+			printf("%s"
+				   "Mapped GPU Memory (handle: 0x%016lx) %p - %p\n"
+				   "GPU Page: version=%u, size=%u, n_entries=%u\n"
+				   "Owner: uid=%u\n",
+				   (i == 0 ? "" : "\n"),
+				   cmd_info->handle,
+				   (void *)(cmd_info->paddrs[0] +
+							cmd_info->map_offset),
+				   (void *)(cmd_info->paddrs[0] +
+							cmd_info->map_offset + cmd_info->map_length),
+				   cmd_info->version,
+				   cmd_info->gpu_page_sz,
+				   cmd_info->nitems,
+				   cmd_info->owner);
+
+			for (j=0; j < cmd_info->nitems; j++)
+			{
+				printf("+%08lx: %p - %p\n",
+					   j * (size_t)cmd_info->gpu_page_sz,
+					   (void *)(cmd_info->paddrs[j]),
+					   (void *)(cmd_info->paddrs[j] + cmd_info->gpu_page_sz));
+			}
 		}
 		i++;
 	}
@@ -558,8 +547,8 @@ static void usage(const char *cmdname)
 			"    -s <size of chunk in MB>: (default 32MB)\n"
 			"    -c : Enables corruption check (default off)\n"
 			"    -h : Print this message (default off)\n"
-			"    -f (i/o size in KB): Test by VFS access (default off)\n"
-			"    -i : Dump the current device memory mapping, with no test\n",
+			"    -f (<i/o size in KB>): Test by VFS access (default off)\n"
+			"    -p (<map handle>): Print property of mapped device memory",
 			basename(strdup(cmdname)));
 	exit(1);
 }
@@ -605,9 +594,6 @@ int main(int argc, char * const argv[])
 				if (optarg)
 					vfs_io_size = (size_t)atoi(optarg) << 10;
 				break;
-			case 'i':
-				dump_iomem = 1;
-				break;
 			case 'h':
 			default:
 				usage(argv[0]);
@@ -616,8 +602,9 @@ int main(int argc, char * const argv[])
 	}
 	buffer_size = (size_t)chunk_size * num_chunks;
 
-	if (dump_iomem)
-		return exec_dump_iomem();
+	/* dump the current device memory mapping */
+	if (print_mapping)
+		return ioctl_print_gpu_memory();
 
 	if (optind + 1 == argc)
 		filename = argv[optind];
@@ -669,10 +656,6 @@ int main(int argc, char * const argv[])
 	cuda_exit_on_error(rc, "cuMemsetD32");
 
 	mgmem_handle = ioctl_map_gpu_memory(cuda_devptr, buffer_size);
-
-	/* print device memory map information */
-	if (print_mapping)
-		ioctl_info_gpu_memory(mgmem_handle, buffer_size / 4096);
 
 	/* execute test by SSD-to-GPU or SSD-to-CPU-to-GPU */
 	if (!test_by_vfs)

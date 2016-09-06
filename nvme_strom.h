@@ -63,13 +63,13 @@ struct StromCmd__InfoGpuMemory
 {
 	unsigned long	handle;		/* in: handler of the mapped region */
 	uint32_t		nrooms;		/* in: length of the variable length array */
+	uint32_t		nitems;		/* out: number of GPU pages */
 	uint32_t		version;	/* out: 'version' of the page tables */
 	uint32_t		gpu_page_sz;/* out: 'page_size' in bytes */
-	uint32_t		nitems;		/* out: number of GPU pages */
-	struct {
-		void	   *vaddr;		/* out: io-mapped virtual address */
-		uint64_t	paddr;		/* out: physical address */
-	} pages[1];
+	uint32_t		owner;		/* out: UID of the owner */
+	unsigned long	map_offset;	/* out: offset of valid area from the head */
+	unsigned long	map_length;	/* out: length of valid area */
+	uint64_t		paddrs[1];	/* out: array of physical addresses */
 };
 typedef struct StromCmd__InfoGpuMemory	StromCmd__InfoGpuMemory;
 
