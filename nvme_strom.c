@@ -315,7 +315,6 @@ strom_put_mapped_gpu_memory(mapped_gpu_memory *mgmem)
 			wake_up_process(mgmem->wait_task);
 			mgmem->wait_task = NULL;
 		}
-		module_put(THIS_MODULE);
 	}
 	spin_unlock_irqrestore(lock, flags);
 }
@@ -380,6 +379,8 @@ callback_release_mapped_gpu_memory(void *private)
 	kfree(mgmem);
 
 	prNotice("P2P GPU Memory (handle=%p) was released", (void *)handle);
+
+	module_put(THIS_MODULE);
 }
 
 /*
