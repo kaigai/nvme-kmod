@@ -8,6 +8,9 @@
  */
 #ifndef NVME_STROM_H
 #define NVME_STROM_H
+#ifndef __KERNEL__
+#define __user
+#endif
 #include <asm/ioctl.h>
 
 enum {
@@ -19,6 +22,7 @@ enum {
 	STROM_IOCTL__MEMCPY_SSD2GPU			= _IO('S',0x85),
 	STROM_IOCTL__MEMCPY_SSD2GPU_ASYNC	= _IO('S',0x86),
 	STROM_IOCTL__MEMCPY_SSD2GPU_WAIT	= _IO('S',0x87),
+	STROM_IOCTL__MEMCPY_SSD2GPU_REORDER	= _IO('S',0x88),
 };
 
 /* path of ioctl(2) entrypoint */
@@ -94,6 +98,24 @@ struct StromCmd__MemCpySsdToGpu
 	strom_dma_chunk	chunks[1];	/* in: ...variable length array... */
 };
 typedef struct StromCmd__MemCpySsdToGpu	StromCmd__MemCpySsdToGpu;
+
+/* STROM_IOCTL__MEMCPY_SSD2GPU_REORDER */
+struct StromCmd__MemCpySsdToGpuReorder
+{
+	unsigned long	dma_task_id;/* out: ID of the DMA task */
+	unsigned int	nr_ram2gpu;	/* out: # of blocks for RAM2GPU */
+	unsigned int	nr_ssd2gpu;	/* out: # of blocks for SSD2GPU */
+	unsigned long	handle;		/* in: handle of the mapped GPU memory */
+	size_t			offset;		/* in: offset from the mapped head */
+	size_t			unitsz;		/* in: length of each block size */
+	uint32_t __user *blck_nums;	/* in: pointer to BlockNumber array (option) */
+	void __user	   *blck_data;	/* in: pointer to the block-data buffer,
+								 *     for write back if page cached */
+	int				fdesc;		/* in: file descriptor */
+	int				nchunks;	/* in: number of chunks */
+	loff_t			chunks[1];	/* in: head of the file position */
+};
+typedef struct StromCmd__MemCpySsdToGpuReorder StromCmd__MemCpySsdToGpuReorder;
 
 /* STROM_IOCTL__MEMCPY_SSD2GPU_WAIT */
 typedef struct
