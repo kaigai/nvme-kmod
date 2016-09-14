@@ -12,25 +12,18 @@
 #ifdef CONFIG_X86_64
 #include <asm/i387.h>
 #endif
-#include <linux/async_tx.h>
 #include <linux/buffer_head.h>
-#include <linux/dmaengine.h>
 #include <linux/crc32c.h>
 #include <linux/file.h>
 #include <linux/fs.h>
-#include <linux/genhd.h>
 #include <linux/kallsyms.h>
 #include <linux/kernel.h>
-#include <linux/kthread.h>
 #include <linux/magic.h>
 #include <linux/major.h>
 #include <linux/moduleparam.h>
 #include <linux/nvme.h>
-#include <linux/notifier.h>
 #include <linux/proc_fs.h>
 #include <linux/sched.h>
-#include <linux/seq_file.h>
-#include <linux/slab.h>
 #include <linux/version.h>
 #include <generated/utsrelease.h>
 #include "nv-p2p.h"
@@ -108,94 +101,6 @@ MODULE_PARM_DESC(verbose, "turn on/off debug message");
 
 /* procfs entry of "/proc/nvme-strom" */
 static struct proc_dir_entry  *nvme_strom_proc = NULL;
-
-/*
- * Fast memcpy implementation by AVX/SSE registers
- */
-static void
-memcpy_simd(volatile void __iomem *__dst, const void *__src, size_t nbytes)
-{
-	volatile char __iomem *dst = __dst;
-	const char *src = __src;
-	size_t		unitsz;
-
-#ifdef CONFIG_X86_64
-	kernel_fpu_begin();
-	/*
-	 * Use of %ymm register needs 256-bits alignment
-	 */
-	if (cpu_has_avx &&
-		((uintptr_t)dst & 0x1f) == 0 && ((uintptr_t)src & 0x1f) == 0)
-	{
-		unitsz = 8 * 0x20;	/* 8x 256bits register */
-
-		while (nbytes >= unitsz)
-		{
-			/* read */
-			asm volatile("vmovdqa %0,%%ymm0" : : "m" (src[0x00]));
-			asm volatile("vmovdqa %0,%%ymm1" : : "m" (src[0x20]));
-			asm volatile("vmovdqa %0,%%ymm2" : : "m" (src[0x40]));
-			asm volatile("vmovdqa %0,%%ymm3" : : "m" (src[0x60]));
-			asm volatile("vmovdqa %0,%%ymm4" : : "m" (src[0x80]));
-			asm volatile("vmovdqa %0,%%ymm5" : : "m" (src[0xa0]));
-			asm volatile("vmovdqa %0,%%ymm6" : : "m" (src[0xc0]));
-			asm volatile("vmovdqa %0,%%ymm7" : : "m" (src[0xe0]));
-
-			/* write */
-			asm volatile("vmovdqa %%ymm0,%0" : : "m" (dst[0x00]));
-			asm volatile("vmovdqa %%ymm1,%0" : : "m" (dst[0x20]));
-			asm volatile("vmovdqa %%ymm2,%0" : : "m" (dst[0x40]));
-			asm volatile("vmovdqa %%ymm3,%0" : : "m" (dst[0x60]));
-			asm volatile("vmovdqa %%ymm4,%0" : : "m" (dst[0x80]));
-			asm volatile("vmovdqa %%ymm5,%0" : : "m" (dst[0xa0]));
-			asm volatile("vmovdqa %%ymm6,%0" : : "m" (dst[0xc0]));
-			asm volatile("vmovdqa %%ymm7,%0" : : "m" (dst[0xe0]));
-
-			dst += unitsz;
-			src += unitsz;
-			nbytes -= unitsz;
-		}
-	}
-
-	/*
-	 * Use of %xmm register needs 128bits alignment
-	 */
-	if (cpu_has_xmm &&
-		((uintptr_t)dst & 0x0f) == 0 && ((uintptr_t)src & 0x0f) == 0)
-	{
-		unitsz = 8 * 0x10;	/* 8x 128bits register */
-
-		while (nbytes >= unitsz)
-		{
-			/* read */
-			asm volatile("movdqa %0,%%xmm0" : : "m" (src[0x00]));
-			asm volatile("movdqa %0,%%xmm1" : : "m" (src[0x10]));
-			asm volatile("movdqa %0,%%xmm2" : : "m" (src[0x20]));
-			asm volatile("movdqa %0,%%xmm3" : : "m" (src[0x30]));
-			asm volatile("movdqa %0,%%xmm4" : : "m" (src[0x40]));
-			asm volatile("movdqa %0,%%xmm5" : : "m" (src[0x50]));
-			asm volatile("movdqa %0,%%xmm6" : : "m" (src[0x60]));
-			asm volatile("movdqa %0,%%xmm7" : : "m" (src[0x70]));
-
-			/* write */
-			asm volatile("movdqa %%xmm0,%0" : : "m" (dst[0x00]));
-			asm volatile("movdqa %%xmm1,%0" : : "m" (dst[0x10]));
-			asm volatile("movdqa %%xmm2,%0" : : "m" (dst[0x20]));
-			asm volatile("movdqa %%xmm3,%0" : : "m" (dst[0x30]));
-			asm volatile("movdqa %%xmm4,%0" : : "m" (dst[0x40]));
-			asm volatile("movdqa %%xmm5,%0" : : "m" (dst[0x50]));
-			asm volatile("movdqa %%xmm6,%0" : : "m" (dst[0x60]));
-			asm volatile("movdqa %%xmm7,%0" : : "m" (dst[0x70]));
-
-			dst += unitsz;
-			src += unitsz;
-			nbytes -= unitsz;
-		}
-	}
-	kernel_fpu_end();
-#endif
-	memcpy_toio(dst, src, nbytes);
-}
 
 /*
  * ================================================================
@@ -1092,55 +997,136 @@ strom_put_dma_task(strom_dma_task *dtask, long dma_status)
 }
 
 /*
- * DMA transaction for RAM->GPU asynchronous copy
+ * Slow RAM->GPU synchronous copy
  */
-struct strom_ram2gpu_request {
-	strom_dma_task	   *dtask;
-	struct page		   *fpage;
-};
-typedef struct strom_ram2gpu_request	strom_ram2gpu_request;
+static void
+memcpy_simd(volatile void __iomem *__dst, const void *__src, size_t nbytes)
+{
+	volatile char __iomem *dst = __dst;
+	const char *src = __src;
+	size_t		unitsz;
+
+#ifdef CONFIG_X86_64
+	kernel_fpu_begin();
+	/*
+	 * Use of %ymm register needs 256-bits alignment
+	 */
+	if (cpu_has_avx &&
+		((uintptr_t)dst & 0x1f) == 0 && ((uintptr_t)src & 0x1f) == 0)
+	{
+		unitsz = 8 * 0x20;	/* 8x 256bits register */
+
+		while (nbytes >= unitsz)
+		{
+			/* read */
+			asm volatile("vmovdqa %0,%%ymm0" : : "m" (src[0x00]));
+			asm volatile("vmovdqa %0,%%ymm1" : : "m" (src[0x20]));
+			asm volatile("vmovdqa %0,%%ymm2" : : "m" (src[0x40]));
+			asm volatile("vmovdqa %0,%%ymm3" : : "m" (src[0x60]));
+			asm volatile("vmovdqa %0,%%ymm4" : : "m" (src[0x80]));
+			asm volatile("vmovdqa %0,%%ymm5" : : "m" (src[0xa0]));
+			asm volatile("vmovdqa %0,%%ymm6" : : "m" (src[0xc0]));
+			asm volatile("vmovdqa %0,%%ymm7" : : "m" (src[0xe0]));
+
+			/* write */
+			asm volatile("vmovdqa %%ymm0,%0" : : "m" (dst[0x00]));
+			asm volatile("vmovdqa %%ymm1,%0" : : "m" (dst[0x20]));
+			asm volatile("vmovdqa %%ymm2,%0" : : "m" (dst[0x40]));
+			asm volatile("vmovdqa %%ymm3,%0" : : "m" (dst[0x60]));
+			asm volatile("vmovdqa %%ymm4,%0" : : "m" (dst[0x80]));
+			asm volatile("vmovdqa %%ymm5,%0" : : "m" (dst[0xa0]));
+			asm volatile("vmovdqa %%ymm6,%0" : : "m" (dst[0xc0]));
+			asm volatile("vmovdqa %%ymm7,%0" : : "m" (dst[0xe0]));
+
+			dst += unitsz;
+			src += unitsz;
+			nbytes -= unitsz;
+		}
+	}
+
+	/*
+	 * Use of %xmm register needs 128bits alignment
+	 */
+	if (cpu_has_xmm &&
+		((uintptr_t)dst & 0x0f) == 0 && ((uintptr_t)src & 0x0f) == 0)
+	{
+		unitsz = 8 * 0x10;	/* 8x 128bits register */
+
+		while (nbytes >= unitsz)
+		{
+			/* read */
+			asm volatile("movdqa %0,%%xmm0" : : "m" (src[0x00]));
+			asm volatile("movdqa %0,%%xmm1" : : "m" (src[0x10]));
+			asm volatile("movdqa %0,%%xmm2" : : "m" (src[0x20]));
+			asm volatile("movdqa %0,%%xmm3" : : "m" (src[0x30]));
+			asm volatile("movdqa %0,%%xmm4" : : "m" (src[0x40]));
+			asm volatile("movdqa %0,%%xmm5" : : "m" (src[0x50]));
+			asm volatile("movdqa %0,%%xmm6" : : "m" (src[0x60]));
+			asm volatile("movdqa %0,%%xmm7" : : "m" (src[0x70]));
+
+			/* write */
+			asm volatile("movdqa %%xmm0,%0" : : "m" (dst[0x00]));
+			asm volatile("movdqa %%xmm1,%0" : : "m" (dst[0x10]));
+			asm volatile("movdqa %%xmm2,%0" : : "m" (dst[0x20]));
+			asm volatile("movdqa %%xmm3,%0" : : "m" (dst[0x30]));
+			asm volatile("movdqa %%xmm4,%0" : : "m" (dst[0x40]));
+			asm volatile("movdqa %%xmm5,%0" : : "m" (dst[0x50]));
+			asm volatile("movdqa %%xmm6,%0" : : "m" (dst[0x60]));
+			asm volatile("movdqa %%xmm7,%0" : : "m" (dst[0x70]));
+
+			dst += unitsz;
+			src += unitsz;
+			nbytes -= unitsz;
+		}
+	}
+	kernel_fpu_end();
+#endif
+	memcpy_toio(dst, src, nbytes);
+}
 
 static int
-submit_ram2gpu_memcpy(strom_dma_state *dstate, size_t dest_offset,
-					  struct page *fpage, size_t page_ofs, size_t page_len)
+slow_ram2gpu_memcpy(strom_dma_state *dstate, size_t dest_offset,
+					struct page *fpage, size_t page_ofs, size_t page_len)
 {
 	strom_dma_task	   *dtask = dstate->dtask;
 	mapped_gpu_memory  *mgmem = dtask->mgmem;
 	nvidia_p2p_page_table_t *page_table = mgmem->page_table;
+	uint64_t			phy_addr;
 	char			   *src_buffer;
 	char			   *dst_buffer;
 	size_t				copy_len;
 	int					i;
 
-retry:
-	i = dest_offset >> mgmem->gpu_page_shift;
-	copy_len = Min(page_len, (mgmem->gpu_page_sz -
-							  (dest_offset & (mgmem->gpu_page_sz - 1))));
+	do {
+		i = dest_offset >> mgmem->gpu_page_shift;
+		copy_len = Min(page_len, (mgmem->gpu_page_sz -
+								  (dest_offset & (mgmem->gpu_page_sz - 1))));
 
-	/* map destination GPU page, if needed */
-	if (!dstate->dest_iomap || i != dstate->dest_index)
-	{
-		if (dstate->dest_iomap)
-			iounmap(dstate->dest_iomap);
-		Assert(i < mgmem->page_table->entries);
-		dstate->dest_iomap = ioremap(page_table->pages[i]->physical_address,
-									 mgmem->gpu_page_sz);
-		if (!dstate->dest_iomap)
-			return -ENOMEM;
-		dstate->dest_index = i;
-	}
+		/* map destination GPU page, if needed */
+		if (!dstate->dest_iomap || i != dstate->dest_index)
+		{
+			if (dstate->dest_iomap)
+				iounmap(dstate->dest_iomap);
+			Assert(i < mgmem->page_table->entries);
+			phy_addr = page_table->pages[i]->physical_address;
+			dstate->dest_iomap = ioremap(phy_addr, mgmem->gpu_page_sz);
+			if (!dstate->dest_iomap)
+				return -ENOMEM;
+			dstate->dest_index = i;
+		}
 
-	/* map source RAM page, and memcpy by CPU */
-	src_buffer = kmap_atomic(fpage);
-	dst_buffer = dstate->dest_iomap + (dest_offset & (mgmem->gpu_page_sz - 1));
-	memcpy_simd(dst_buffer, src_buffer + page_ofs, copy_len);
-	__kunmap_atomic(src_buffer);
+		/* map source RAM page, and memcpy by CPU */
+		src_buffer = kmap_atomic(fpage);
+		dst_buffer = (dstate->dest_iomap +
+					  (dest_offset & (mgmem->gpu_page_sz - 1)));
+		memcpy_simd(dst_buffer, src_buffer + page_ofs, copy_len);
+		__kunmap_atomic(src_buffer);
 
-	page_len -= copy_len;
-	page_ofs += copy_len;
-	dest_offset += copy_len;
-	if (page_len > 0)
-		goto retry;
+		page_len -= copy_len;
+		page_ofs += copy_len;
+		dest_offset += copy_len;
+	} while (page_len > 0);
+
 	return 0;
 }
 
@@ -1531,9 +1517,9 @@ do_ssd2gpu_async_memcpy(strom_dma_state *dstate,
 					Assert(dstate->nr_blocks == 0);
 				}
 
-				/* Submit RAM2GPU DMA */
-				retval = submit_ram2gpu_memcpy(dstate, curr_offset,
-											   fpage, page_ofs, page_len);
+				/* Slow RAM2GPU Copy */
+				retval = slow_ram2gpu_memcpy(dstate, curr_offset,
+											 fpage, page_ofs, page_len);
 				if (retval)
 				{
 					page_cache_release(fpage);
@@ -1791,11 +1777,11 @@ exec_ssd2gpu_memcpy_async(strom_dma_state *dstate,
 				Assert(dstate->nr_blocks == 0);
 			}
 			/* Fallback to slow memcpy */
-			retval = submit_ram2gpu_memcpy(dstate, dest_offset,
-										   fpage, page_ofs, page_len);
+			retval = slow_ram2gpu_memcpy(dstate, dest_offset,
+										 fpage, page_ofs, page_len);
 			if (retval)
 			{
-				prDebug("submit_ram2gpu_memcpy() = %ld", retval);
+				prDebug("slow_ram2gpu_memcpy() = %ld", retval);
 				goto error;
 			}
 			page_cache_release(fpage);
