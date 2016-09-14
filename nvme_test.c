@@ -39,6 +39,7 @@ static int		num_chunks = 6;
 static size_t	chunk_size = 32UL << 20;
 static int		enable_checks = 0;
 static int		print_mapping = 0;
+static int		test_by_writeback = 0;
 static int		test_by_vfs = 0;
 static size_t	vfs_io_size = 0;
 
@@ -212,7 +213,7 @@ setup_async_tasks(int fdesc)
 							CU_STREAM_DEFAULT);
 		cuda_exit_on_error(rc, "cuStreamCreate");
 
-		if (enable_checks || test_by_vfs)
+		if (enable_checks || test_by_vfs || test_by_writeback)
 		{
 			rc = cuMemAllocHost(&async_tasks[i].src_buffer, chunk_size);
 			cuda_exit_on_error(rc, "cuMemAllocHost");
@@ -356,6 +357,118 @@ exec_test_by_strom(CUdeviceptr cuda_devptr, unsigned long handle,
 			async_task *atask = &async_tasks[j];
 			if (atask->is_running)
 				break;	/* here is still running task */
+		}
+		pthread_mutex_unlock(&buffer_lock);
+	} while (j < num_chunks);
+	gettimeofday(&tv2, NULL);
+	show_throughput(filename, file_size, tv1, tv2);
+}
+
+static void
+exec_test_by_writeback(CUdeviceptr cuda_devptr, unsigned long mgmem_handle,
+					   const char *filename, int fdesc, size_t file_size)
+{
+	StromCmd__MemCpySsdToGpuWriteBack *uarg;
+	async_task	   *async_tasks;
+	CUresult		rc;
+	int				i, j, rv;
+	int				num_blocks;
+	size_t			unitsz = 8192;
+	size_t			offset;
+	struct timeval	tv1, tv2;
+
+	assert(chunk_size % unitsz == 0);
+	num_blocks = chunk_size / unitsz;
+
+	uarg = malloc(offsetof(StromCmd__MemCpySsdToGpuWriteBack,
+						   chunks[num_blocks]));
+	if (!uarg)
+		system_exit_on_error(!uarg, "out of memory");
+
+	async_tasks = setup_async_tasks(fdesc);
+	gettimeofday(&tv1, NULL);
+    for (offset=0; offset < file_size; offset += chunk_size)
+	{
+		async_task *atask = NULL;
+
+		rv = sem_wait(&buffer_sem);
+		system_exit_on_error(rv, "sem_wait");
+
+		/* find out an available async_task */
+		pthread_mutex_lock(&buffer_lock);
+		for (j=0; j < num_chunks; j++)
+		{
+			atask = &async_tasks[i++ % num_chunks];
+			if (!atask->is_running)
+			{
+				atask->is_running = 1;
+				break;	/* found */
+			}
+		}
+		if (j == num_chunks)
+		{
+			fprintf(stderr, "Bug? no free async_task but semaphore > 0\n");
+			exit(1);
+		}
+		pthread_mutex_unlock(&buffer_lock);
+
+		/* kick SSD-to-GPU DMA */
+		memset(uarg, 0, offsetof(StromCmd__MemCpySsdToGpuWriteBack,
+								 chunks[num_blocks]));
+		uarg->handle	= mgmem_handle;
+		uarg->offset	= atask->index * chunk_size;;
+		uarg->unitsz	= unitsz;
+		uarg->blck_nums	= NULL;	/* not supported yet */
+		uarg->blck_data	= atask->src_buffer;
+		uarg->fdesc		= fdesc;
+		uarg->nchunks   = Min(file_size - offset, chunk_size) / unitsz;
+		for (j=0; j < uarg->nchunks; j++)
+			uarg->chunks[j] = offset + j * unitsz;
+		rv = nvme_strom_ioctl(STROM_IOCTL__MEMCPY_SSD2GPU_WRITEBACK, uarg);
+		system_exit_on_error(rv, "STROM_IOCTL__MEMCPY_SSD2GPU_ASYNC");
+		atask->dma_task_id = uarg->dma_task_id;
+
+		/* kick RAM-to-GPU DMA on demand */
+		assert(uarg->nr_ram2gpu + uarg->nr_ssd2gpu == uarg->nchunks);
+		if (uarg->nr_ram2gpu > 0)
+		{
+			rc = cuMemcpyHtoDAsync(cuda_devptr +
+								   atask->index * chunk_size +
+								   uarg->nr_ssd2gpu * unitsz,
+								   (char *)atask->src_buffer +
+								   uarg->nr_ssd2gpu * unitsz,
+								   uarg->nr_ram2gpu * unitsz,
+								   atask->cuda_stream);
+			cuda_exit_on_error(rc, "cuMemcpyHtoDAsync");
+		}
+
+		/* kick GPU-to-RAM DMA */
+		if (enable_checks)
+		{
+			rc = cuMemcpyDtoHAsync(atask->dest_buffer,
+								   cuda_devptr + atask->index * chunk_size,
+								   chunk_size,
+								   atask->cuda_stream);
+			cuda_exit_on_error(rc, "cuMemcpyDtoHAsync");
+		}
+
+		/* kick callback to release atask */
+		rc = cuStreamAddCallback(atask->cuda_stream,
+								 callback_release_atask, atask, 0);
+		cuda_exit_on_error(rc, "cuStreamAddCallback");
+	}
+
+	/* wait for completion of the asyncronous tasks */
+	do {
+		rv = sem_wait(&buffer_sem);
+		system_exit_on_error(rv, "sem_wait");
+
+		pthread_mutex_lock(&buffer_lock);
+		for (j=0; j < num_chunks; j++)
+		{
+			async_task *atask = &async_tasks[j];
+			if (atask->is_running)
+				break;		/* here is still running task */
 		}
 		pthread_mutex_unlock(&buffer_lock);
 	} while (j < num_chunks);
@@ -571,7 +684,7 @@ int main(int argc, char * const argv[])
 	char			devname[256];
 	int				code;
 
-	while ((code = getopt(argc, argv, "d:n:s:cpf::ih")) >= 0)
+	while ((code = getopt(argc, argv, "d:n:s:cpf::wh")) >= 0)
 	{
 		switch (code)
 		{
@@ -591,9 +704,22 @@ int main(int argc, char * const argv[])
 				print_mapping = 1;
 				break;
 			case 'f':
+				if (test_by_writeback)
+				{
+					fprintf(stderr, "cannot use -f option with -w together\n");
+					return 1;
+				}
 				test_by_vfs = 1;
 				if (optarg)
 					vfs_io_size = (size_t)atoi(optarg) << 10;
+				break;
+			case 'w':
+				if (test_by_vfs)
+				{
+					fprintf(stderr, "cannot use -w option with -f together\n");
+					return 1;
+				}
+				test_by_writeback = 1;
 				break;
 			case 'h':
 			default:
@@ -688,7 +814,10 @@ int main(int argc, char * const argv[])
 	else
 		printf(", i/o size: %.2fGB", (double)filesize / (double)(1UL << 30));
 	if (test_by_vfs)
-		printf(" by VFS");
+		printf(" by VFS (i/o unitsz: %zuKB)", vfs_io_size >> 10);
+	else if (test_by_writeback)
+		printf(" by WB-Cache");
+
 	printf(", buffer %zuMB x %d\n",
 		   chunk_size >> 20, num_chunks);
 
@@ -704,12 +833,15 @@ int main(int argc, char * const argv[])
 
 	mgmem_handle = ioctl_map_gpu_memory(cuda_devptr, buffer_size);
 
-	/* execute test by SSD-to-GPU or SSD-to-CPU-to-GPU */
-	if (!test_by_vfs)
-		exec_test_by_strom(cuda_devptr, mgmem_handle,
-						   filename, fdesc, filesize);
-	else
+	/* test execution */
+	if (test_by_vfs)
 		exec_test_by_vfs(cuda_devptr, mgmem_handle,
 						 filename, fdesc, filesize);
+	else if (test_by_writeback)
+		exec_test_by_writeback(cuda_devptr, mgmem_handle,
+							   filename, fdesc, filesize);
+	else
+		exec_test_by_strom(cuda_devptr, mgmem_handle,
+						   filename, fdesc, filesize);
 	return 0;
 }
