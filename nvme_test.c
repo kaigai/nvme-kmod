@@ -34,7 +34,7 @@
 #define Min(a,b)				((a) < (b) ? (a) : (b))
 
 /* command line options */
-static int		device_index = 0;
+static int		device_index = -1;
 static int		num_chunks = 6;
 static size_t	chunk_size = 32UL << 20;
 static int		enable_checks = 0;
@@ -548,7 +548,7 @@ static void usage(const char *cmdname)
 			"    -c : Enables corruption check (default off)\n"
 			"    -h : Print this message (default off)\n"
 			"    -f (<i/o size in KB>): Test by VFS access (default off)\n"
-			"    -p (<map handle>): Print property of mapped device memory",
+			"    -p (<map handle>): Print property of mapped device memory\n",
 			basename(strdup(cmdname)));
 	exit(1);
 }
@@ -568,6 +568,7 @@ int main(int argc, char * const argv[])
 	CUcontext		cuda_context;
 	CUdeviceptr		cuda_devptr;
 	unsigned long	mgmem_handle;
+	char			devname[256];
 	int				code;
 
 	while ((code = getopt(argc, argv, "d:n:s:cpf::ih")) >= 0)
@@ -642,8 +643,54 @@ int main(int argc, char * const argv[])
 	rc = cuInit(0);
 	cuda_exit_on_error(rc, "cuInit");
 
-	rc = cuDeviceGet(&cuda_device, device_index);
-	cuda_exit_on_error(rc, "cuDeviceGet");
+	if (device_index < 0)
+	{
+		int		count;
+
+		rc = cuDeviceGetCount(&count);
+		cuda_exit_on_error(rc, "cuDeviceGetCount");
+
+		for (device_index = 0; device_index < count; device_index++)
+		{
+			rc = cuDeviceGet(&cuda_device, device_index);
+			cuda_exit_on_error(rc, "cuDeviceGet");
+
+			rc = cuDeviceGetName(devname, sizeof(devname), cuda_device);
+			cuda_exit_on_error(rc, "cuDeviceGetName");
+
+			if (strstr(devname, "Tesla") != NULL ||
+				strstr(devname, "Quadro") != NULL)
+				break;
+		}
+		if (device_index == count)
+		{
+			fprintf(stderr, "No Tesla or Quadro GPUs are installed\n");
+			return 1;
+		}
+	}
+	else
+	{
+		rc = cuDeviceGet(&cuda_device, device_index);
+		cuda_exit_on_error(rc, "cuDeviceGet");
+
+		rc = cuDeviceGetName(devname, sizeof(devname), cuda_device);
+		cuda_exit_on_error(rc, "cuDeviceGetName");
+	}
+
+	/* print test scenario */
+	printf("GPU[%d] %s - file: %s", device_index, devname, filename);
+	if (filesize < (4UL << 10))
+		printf(", i/o size: %zuB", filesize);
+	else if (filesize < (4UL << 20))
+		printf(", i/o size: %.2fKB", (double)filesize / (double)(1UL << 10));
+	else if (filesize < (4UL << 30))
+		printf(", i/o size: %.2fMB", (double)filesize / (double)(1UL << 20));
+	else
+		printf(", i/o size: %.2fGB", (double)filesize / (double)(1UL << 30));
+	if (test_by_vfs)
+		printf(" by VFS");
+	printf(", buffer %zuMB x %d\n",
+		   chunk_size >> 20, num_chunks);
 
 	rc = cuCtxCreate(&cuda_context, CU_CTX_SCHED_AUTO, cuda_device);
 	cuda_exit_on_error(rc, "cuCtxCreate");
