@@ -429,8 +429,8 @@ exec_test_by_writeback(CUdeviceptr cuda_devptr, unsigned long mgmem_handle,
 		uarg->handle	= mgmem_handle;
 		uarg->offset	= atask->index * chunk_size;;
 		uarg->unitsz	= WB_UNITSZ;
-		uarg->blck_nums	= NULL;	/* not supported yet */
-		uarg->blck_data	= atask->src_buffer;
+		uarg->block_nums= NULL;
+		uarg->block_data= atask->src_buffer;
 		uarg->fdesc		= fdesc;
 		uarg->nchunks   = Min(file_size - offset, chunk_size) / WB_UNITSZ;
 		for (j=0; j < uarg->nchunks; j++)

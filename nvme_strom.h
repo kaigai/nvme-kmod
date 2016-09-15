@@ -101,8 +101,8 @@ typedef struct StromCmd__MemCpySsdToGpuWriteBack
 	unsigned long	handle;		/* in: handle of the mapped GPU memory */
 	size_t			offset;		/* in: offset from the mapped head */
 	size_t			unitsz;		/* in: length of each block size */
-	uint32_t __user *blck_nums;	/* in: pointer to BlockNumber array (option) */
-	void __user	   *blck_data;	/* in: pointer to the block-data buffer,
+	uint32_t __user *block_nums;/* in: pointer to BlockNumber array (option) */
+	void __user	   *block_data;	/* in: pointer to the block-data buffer,
 								 *     for write back if page cached */
 	int				fdesc;		/* in: file descriptor */
 	int				nchunks;	/* in: number of chunks */

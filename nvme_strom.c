@@ -1491,7 +1491,6 @@ do_ssd2gpu_async_memcpy(strom_dma_state *dstate,
 			Assert((page_ofs & (dstate->blocksz - 1)) == 0 &&
 				   (page_len & (dstate->blocksz - 1)) == 0);
 
-			fpage = find_get_page(filp->f_mapping, pos >> PAGE_CACHE_SHIFT);
 			/*
 			 * NOTE: Theoretical performance of RAM-to-GPU transfer should
 			 * be faster than SSD-to-GPU, however, we cannot use DMA engine
@@ -1502,6 +1501,7 @@ do_ssd2gpu_async_memcpy(strom_dma_state *dstate,
 			 * So, as a workaround, RAM-to-GPU transfer shall be applied
 			 * only when the cached page is dirty.
 			 */
+			fpage = find_lock_page(filp->f_mapping, pos >> PAGE_CACHE_SHIFT);
 			if (fpage && PageDirty(fpage))
 			{
 				/* Submit SSD2GPU DMA, if any pending request */
@@ -1510,8 +1510,10 @@ do_ssd2gpu_async_memcpy(strom_dma_state *dstate,
 					retval = submit_ssd2gpu_memcpy(dstate);
 					if (retval)
 					{
-						prDebug("submit_ssd2gpu_memcpy() = %ld", retval);
+						unlock_page(fpage);
 						page_cache_release(fpage);
+
+						prDebug("submit_ssd2gpu_memcpy() = %ld", retval);
 						return retval;
 					}
 					Assert(dstate->nr_blocks == 0);
@@ -1520,9 +1522,13 @@ do_ssd2gpu_async_memcpy(strom_dma_state *dstate,
 				/* Slow RAM2GPU Copy */
 				retval = slow_ram2gpu_memcpy(dstate, curr_offset,
 											 fpage, page_ofs, page_len);
+
+				unlock_page(fpage);
+				page_cache_release(fpage);
+
 				if (retval)
 				{
-					page_cache_release(fpage);
+					prDebug("slow_ram2gpu_memcpy() = %ld", retval);
 					return retval;
 				}
 				curr_offset += page_len;
@@ -1532,6 +1538,13 @@ do_ssd2gpu_async_memcpy(strom_dma_state *dstate,
 				struct buffer_head	bh;
 				sector_t			lba_curr;
 				unsigned int		nr_blocks;
+
+				/* Cache shall not be referenced */
+				if (fpage)
+				{
+					unlock_page(fpage);
+					page_cache_release(fpage);
+				}
 
 				/* Lookup underlying block number */
 				memset(&bh, 0, sizeof(bh));
@@ -1685,6 +1698,7 @@ do_writeback_to_user_buffer(strom_dma_state *dstate,
 				retval = PTR_ERR(fpage);
 				goto error;
 			}
+			lock_page(fpage);
 		}
 		Assert(fpage != NULL);
 
@@ -1704,6 +1718,7 @@ do_writeback_to_user_buffer(strom_dma_state *dstate,
 		left = __copy_to_user(uaddr, kaddr + page_ofs, page_len);
 		kunmap(fpage);
 	success:
+		unlock_page(fpage);
 		page_cache_release(fpage);
 		if (unlikely(left))
 		{
@@ -1722,7 +1737,10 @@ error:
 	{
 		fpage = dstate->file_pages[index++];
 		if (fpage)
+		{
+			unlock_page(fpage);
 			page_cache_release(fpage);
+		}
 	}
 	return retval;
 }
@@ -1784,6 +1802,7 @@ exec_ssd2gpu_memcpy_async(strom_dma_state *dstate,
 				prDebug("slow_ram2gpu_memcpy() = %ld", retval);
 				goto error;
 			}
+			unlock_page(fpage);
 			page_cache_release(fpage);
 		}
 		else
@@ -1835,7 +1854,10 @@ exec_ssd2gpu_memcpy_async(strom_dma_state *dstate,
 
 			/* page cache is no longer referenced */
 			if (fpage)
+			{
+				unlock_page(fpage);
 				page_cache_release(fpage);
+			}
 		}
 		Assert(page_len <= length);
 		length -= page_len;
@@ -1850,7 +1872,10 @@ error:
 	{
 		fpage = dstate->file_pages[index++];
 		if (fpage)
+		{
+			unlock_page(fpage);
 			page_cache_release(fpage);
+		}
 	}
 	return retval;
 }
@@ -1866,6 +1891,7 @@ ioctl_memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack __user *uarg,
 	mapped_gpu_memory  *mgmem;
 	strom_dma_state		dstate;
 	loff_t			   *dchunks;
+	uint32_t		   *block_nums = NULL;
 	unsigned long		dma_task_id;
 	struct file		   *filp;
 	struct page		   *fpage;
@@ -1885,6 +1911,25 @@ ioctl_memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack __user *uarg,
 	{
 		kfree(dchunks);
 		return -EFAULT;
+	}
+
+	/* Optional BlockNumber array if any */
+	if (karg.block_nums)
+	{
+		block_nums = kmalloc(sizeof(uint32_t) * karg.nchunks, GFP_KERNEL);
+		if (!block_nums)
+		{
+			kfree(dchunks);
+			return -ENOMEM;
+		}
+
+		if (copy_from_user(block_nums, karg.block_nums,
+						   sizeof(uint32_t) * karg.nchunks))
+		{
+			kfree(dchunks);
+			kfree(block_nums);
+			return -EFAULT;
+		}
 	}
 
 	/* construct strom_dma_task and strom_dma_state */
@@ -1942,6 +1987,7 @@ ioctl_memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack __user *uarg,
 	{
 		loff_t		fpos = dchunks[i];
 		loff_t		fend = fpos + karg.unitsz;
+		uint32_t	block_nr = (block_nums ? block_nums[i] : 0x7e7e7e7e);
 		uint		nr_cached = 0;
 		uint		nr_pages = 0;
 		bool		has_dirty_pages = false;
@@ -1972,7 +2018,7 @@ ioctl_memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack __user *uarg,
 			else
 				page_len = PAGE_CACHE_SIZE - page_ofs;
 
-			fpage = find_get_page(filp->f_mapping, fpos >> PAGE_CACHE_SHIFT);
+			fpage = find_lock_page(filp->f_mapping, fpos >> PAGE_CACHE_SHIFT);
 			dstate.file_pages[nr_pages++] = fpage;
 			if (fpage)
 			{
@@ -2002,7 +2048,7 @@ ioctl_memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack __user *uarg,
 		 */
 		if (nr_cached > nr_pages / 2)
 		{
-			char __user *uaddr = (char __user *)karg.blck_data +
+			char __user *uaddr = (char __user *)karg.block_data +
 				(karg.nchunks - karg.nr_ram2gpu - 1) * karg.unitsz;
 			retval = do_writeback_to_user_buffer(&dstate,
 												 nr_pages,
@@ -2010,8 +2056,11 @@ ioctl_memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack __user *uarg,
 												 karg.unitsz,
 												 uaddr);
 			if (retval)
-				return retval;
+				goto out;
+
 			karg.nr_ram2gpu++;
+			if (block_nums)
+				block_nums[karg.nchunks - karg.nr_ram2gpu] = block_nr;
 		}
 		else
 		{
@@ -2020,6 +2069,11 @@ ioctl_memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack __user *uarg,
 											   dchunks[i],
 											   karg.unitsz,
 											   dest_offset);
+			if (retval)
+				goto out;
+
+			if (block_nums)
+				block_nums[karg.nr_ssd2gpu] = block_nr;
 			karg.nr_ssd2gpu++;
 			dest_offset += karg.unitsz;
 		}
@@ -2041,6 +2095,7 @@ out:
 		while (strom_memcpy_ssd2gpu_wait(1, 1, &dma_task_id,
 										 NULL, NULL) == -EINTR);
 	}
+	kfree(block_nums);
 	kfree(dchunks);
 	return retval;
 }
