@@ -166,21 +166,6 @@ nvme_submit_async_read_cmd(strom_dma_state *dstate, struct nvme_iod *iod)
 	slba += dstate->start_sect;
 
 	/* setup scatter-gather list */
-	if (verbose)
-	{
-		int		i;
-
-		prDebug("iod %p {private=%lu npages=%d offset=%d nents=%d length=%d}",
-				iod, iod->private, iod->npages, iod->offset,
-				iod->nents, iod->length);
-		for (i=0; i < iod->nents; i++)
-		{
-			struct scatterlist *sg = &iod->sg[i];
-
-			prDebug("sg[%d] {page_link=%ld offset=%u length=%u daddr=%p}",
-					i, sg->page_link, sg->offset, sg->length, (void *)sg->dma_address);
-		}
-	}
 	prp_len = __nvme_setup_prps(nvme_ns->dev, iod, length, GFP_KERNEL);
 	if (prp_len != length)
 		return -ENOMEM;

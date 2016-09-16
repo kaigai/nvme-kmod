@@ -1210,6 +1210,7 @@ submit_ssd2gpu_memcpy(strom_dma_state *dstate)
 	offset = (dstate->dest_offset & (mgmem->gpu_page_sz - 1));
 	prDebug("base=%d offset=%zu dest_offset=%zu total_nbytes=%zu",
 			base, offset, dstate->dest_offset, total_nbytes);
+
 	for (i=0; i < page_table->entries; i++)
 	{
 		if (!total_nbytes)
@@ -1980,6 +1981,7 @@ ioctl_memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack __user *uarg,
 	/* then, submit asynchronous DMA requests */
 	filp = dstate.dtask->filp;
 	i_size = i_size_read(filp->f_inode);
+	karg.dma_task_id = dma_task_id;
 	karg.nr_ram2gpu = 0;
 	karg.nr_ssd2gpu = 0;
 	dest_offset = mgmem->map_offset + karg.offset;
