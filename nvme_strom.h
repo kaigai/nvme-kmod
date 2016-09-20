@@ -91,25 +91,6 @@ typedef struct StromCmd__MemCpySsdToGpu
 	strom_dma_chunk	chunks[1];	/* in: ...variable length array... */
 } StromCmd__MemCpySsdToGpu;
 
-#if 0
-/* STROM_IOCTL__MEMCPY_SSD2GPU_WRITEBACK */
-typedef struct StromCmd__MemCpySsdToGpuWriteBack
-{
-	unsigned long	dma_task_id;/* out: ID of the DMA task */
-	unsigned int	nr_ram2gpu;	/* out: # of blocks for RAM2GPU */
-	unsigned int	nr_ssd2gpu;	/* out: # of blocks for SSD2GPU */
-	unsigned long	handle;		/* in: handle of the mapped GPU memory */
-	size_t			offset;		/* in: offset from the mapped head */
-	size_t			unitsz;		/* in: length of each block size */
-	uint32_t __user *block_nums;/* in: pointer to BlockNumber array (option) */
-	void __user	   *block_data;	/* in: pointer to the block-data buffer,
-								 *     for write back if page cached */
-	int				fdesc;		/* in: file descriptor */
-	int				nchunks;	/* in: number of chunks */
-	loff_t			chunks[1];	/* in: head of the file position */
-} StromCmd__MemCpySsdToGpuWriteBack;
-#endif
-
 /* STROM_IOCTL__MEMCPY_SSD2GPU_WAIT */
 typedef struct StromCmd__MemCpySsdToGpuWait
 {
