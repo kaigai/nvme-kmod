@@ -135,9 +135,9 @@ nvme_set_info(struct nvme_cmd_info *cmd, void *ctx, nvme_completion_fn handler)
  * thus, strom_memcpy_ssd2gpu_wait() allows synchronization of DMA completion.
  */
 static int
-nvme_submit_async_read_cmd(strom_dma_state *dstate, struct nvme_iod *iod)
+nvme_submit_async_read_cmd(strom_dma_task *dtask, struct nvme_iod *iod)
 {
-	struct nvme_ns		   *nvme_ns = dstate->nvme_ns;
+	struct nvme_ns		   *nvme_ns = dtask->nvme_ns;
 	struct request		   *req;
 	struct nvme_cmd_info   *cmd_rq;
 	struct nvme_command		cmd;
@@ -150,20 +150,20 @@ nvme_submit_async_read_cmd(strom_dma_state *dstate, struct nvme_iod *iod)
 	u64						slba;
 	int						retval = 0;
 
-	Assert(dstate->blocksz_shift >= nvme_ns->lba_shift);
+	Assert(dtask->blocksz_shift >= nvme_ns->lba_shift);
 	/* setup scatter-gather list */
-	length  = (dstate->nr_blocks << dstate->blocksz_shift);
-	nblocks = (dstate->nr_blocks << (dstate->blocksz_shift -
-									 nvme_ns->lba_shift)) - 1;
+	length  = (dtask->nr_blocks << dtask->blocksz_shift);
+	nblocks = (dtask->nr_blocks << (dtask->blocksz_shift -
+									nvme_ns->lba_shift)) - 1;
 	if (nblocks > 0xffff)
 		return -EINVAL;
 	prDebug("src_block=%zu start_sect=%zu nblocks=%u",
-			(size_t)dstate->src_block,
-			(size_t)dstate->start_sect,
+			(size_t)dtask->src_block,
+			(size_t)dtask->start_sect,
 			nblocks);
-	slba = dstate->src_block << (dstate->blocksz_shift -
-								 nvme_ns->lba_shift);
-	slba += dstate->start_sect;
+	slba = dtask->src_block << (dtask->blocksz_shift -
+								nvme_ns->lba_shift);
+	slba += dtask->start_sect;
 
 	/* setup scatter-gather list */
 	prp_len = __nvme_setup_prps(nvme_ns->dev, iod, length, GFP_KERNEL);
@@ -186,7 +186,7 @@ nvme_submit_async_read_cmd(strom_dma_state *dstate, struct nvme_iod *iod)
 	}
 	ssd2gpu_req->req = req;
 	ssd2gpu_req->iod = iod;
-	ssd2gpu_req->dtask = strom_get_dma_task(dstate->dtask);
+	ssd2gpu_req->dtask = strom_get_dma_task(dtask);
 
 	/* setup READ command */
 	if (req->cmd_flags & REQ_FUA)
