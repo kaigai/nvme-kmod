@@ -1,19 +1,22 @@
 /*
  * NVMe-Strom
  *
- * A Linux kernel driver to support SSD-to-GPU direct stream.
+ * A Linux kernel driver to support SSD-to-GPU P2P DMA.
  *
+ * Copyright (C) 2016 KaiGai Kohei <kaigai@kaigai.gr.jp>
  *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
  *
- *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
  */
-#include <asm/cpufeature.h>
 #include <asm/uaccess.h>
-#ifdef CONFIG_X86_64
-#include <asm/i387.h>
-#endif
 #include <linux/buffer_head.h>
-#include <linux/crc32c.h>
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/kallsyms.h>
@@ -29,12 +32,7 @@
 #include "nv-p2p.h"
 #include "nvme_strom.h"
 
-/* turn on/off debug message */
-static int	nvme_strom_debug = 1;
-module_param(nvme_strom_debug, int, 0644);
-MODULE_PARM_DESC(nvme_strom_debug, "");
-
-/* check the target kernel to build */
+/* determine the target kernel to build */
 #if defined(RHEL_MAJOR) && (RHEL_MAJOR == 7)
 #define STROM_TARGET_KERNEL_RHEL7		1
 #else
@@ -55,7 +53,7 @@ MODULE_PARM_DESC(nvme_strom_debug, "");
 
 /* message verbosity control */
 static int	verbose = 0;
-module_param(verbose, int, 1);
+module_param(verbose, int, 0644);
 MODULE_PARM_DESC(verbose, "turn on/off debug message");
 
 #define prDebug(fmt, ...)												\
@@ -433,7 +431,7 @@ ioctl_unmap_gpu_memory(StromCmd__UnmapGpuMemory __user *uarg)
 	list_for_each_entry(mgmem, slot, chain)
 	{
 		/*
-		 * NOTE: I'm not 100% certain whether PID is the right check to
+		 * NOTE: I'm not 100% certain whether UID is the right check to
 		 * determine availability of the virtual address of GPU device.
 		 * So, this behavior may be changed in the later version.
 		 */
@@ -760,10 +758,6 @@ ioctl_check_file(StromCmd__CheckFile __user *uarg)
 /* ================================================================
  *
  * Main part for SSD-to-GPU P2P DMA
- *
- *
- *
- *
  *
  * ================================================================
  */
