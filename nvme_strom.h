@@ -22,7 +22,6 @@ enum {
 	STROM_IOCTL__MEMCPY_SSD2GPU				= _IO('S',0x85),
 	STROM_IOCTL__MEMCPY_SSD2GPU_ASYNC		= _IO('S',0x86),
 	STROM_IOCTL__MEMCPY_SSD2GPU_WAIT		= _IO('S',0x87),
-	STROM_IOCTL__MEMCPY_SSD2GPU_WRITEBACK	= _IO('S',0x88),
 };
 
 /* path of ioctl(2) entrypoint */
@@ -92,6 +91,7 @@ typedef struct StromCmd__MemCpySsdToGpu
 	strom_dma_chunk	chunks[1];	/* in: ...variable length array... */
 } StromCmd__MemCpySsdToGpu;
 
+#if 0
 /* STROM_IOCTL__MEMCPY_SSD2GPU_WRITEBACK */
 typedef struct StromCmd__MemCpySsdToGpuWriteBack
 {
@@ -108,6 +108,7 @@ typedef struct StromCmd__MemCpySsdToGpuWriteBack
 	int				nchunks;	/* in: number of chunks */
 	loff_t			chunks[1];	/* in: head of the file position */
 } StromCmd__MemCpySsdToGpuWriteBack;
+#endif
 
 /* STROM_IOCTL__MEMCPY_SSD2GPU_WAIT */
 typedef struct StromCmd__MemCpySsdToGpuWait
