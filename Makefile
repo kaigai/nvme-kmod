@@ -1,7 +1,8 @@
-NVME_STROM_VERSION := 1.0devel
+NVME_STROM_VERSION := 0.1
 NVME_STROM_VERSION_NUM=$(shell echo $(NVME_STROM_VERSION)	\
     | sed -e 's/\./ /g' -e 's/[A-Za-z].*$$//g'				\
     | awk '{printf "%d%02d%02d", $$1, $$2, (NF >=3) ? $$3 : 0}')
+NVME_STROM_BUILD_TIMESTAMP = $(shell date --utc)
 
 KERNEL_UNAME := $(shell uname -r)
 KERNEL_SOURCE := /lib/modules/$(KERNEL_UNAME)/build
@@ -16,9 +17,10 @@ USERSPACE_FLAGS := -g -I $(CUDA_PATH)/include -L $(CUDA_PATH)/lib64
 EXTRA_CLEAN := nvme_test
 
 obj-m := nvme_strom.o
-ccflags-y := -I. -I$(NVIDIA_SOURCE) 						\
-	-DNVME_STROM_VERSION=\"$(NVME_STROM_VERSION)\"			\
-	-DNVME_STROM_VERSION_NUM=$(NVME_STROM_VERSION_NUM)
+ccflags-y := -I. -I$(NVIDIA_SOURCE) 					\
+	-DNVME_STROM_VERSION='"$(NVME_STROM_VERSION)"'		\
+	-DNVME_STROM_VERSION_NUM=$(NVME_STROM_VERSION_NUM)	\
+	-DNVME_STROM_BUILD_TIMESTAMP='"$(NVME_STROM_BUILD_TIMESTAMP)"'
 
 default: modules nvme_test
 

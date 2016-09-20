@@ -1769,8 +1769,9 @@ ioctl_memcpy_ssd2gpu_wait(StromCmd__MemCpySsdToGpuWait __user *uarg,
  * ================================================================
  */
 static const char  *strom_proc_signature =		\
-	"nvme_strom version " NVME_STROM_VERSION	\
-	" built for linux kernel " UTS_RELEASE;
+	"version: " NVME_STROM_VERSION "\n"			\
+	"target: " UTS_RELEASE "\n"					\
+	"build: " NVME_STROM_BUILD_TIMESTAMP "\n";
 
 static int
 strom_proc_open(struct inode *inode, struct file *filp)
