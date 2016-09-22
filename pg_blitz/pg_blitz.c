@@ -144,9 +144,113 @@ pgblitz_ioctl__check_file(BlitzCmd__CheckFile __user *uarg)
  * ioctl(2) handler of BLITZ_IOCTL__WRITE_FILE
  */
 static long
-pgblitz_ioctl__write_file(BlitzCmd__WriteFile __user *uarg)
+pgblitz_ioctl__write_file(BlitzCmd__WriteFile __user *uarg,
+						  pgblitz_buffer_state *bstate)
 {
+	BlitzCmd__WriteFile karg;
+	struct file		   *filp;
+	struct inode	   *f_inode;
+	struct super_block *i_sb;
+	struct nvme_ns	   *nvme_ns;
+	struct nvme_dev	   *nvme_dev;
+	struct nvme_iod	   *iod;
+	size_t				sector_sz;
+	loff_t				pos, cur, end;
+	int					idx;
+	long				retval;
+
+	if (copy_from_user(&karg, uarg, sizeof(BlitzCmd__WriteFile)))
+		return -EFAULT;
+
+	filp = fget(karg.fdesc);
+	if (!filp)
+		return -EBADF;
+	f_inode = filp->f_inode;
+	i_sb = f_inode->i_sb;
+
+	retval = file_is_supported_nvme(filp, true, &nvme_ns);
+	if (retval)
+		goto error_1;
+
+	/* all the offset has to be aligned to LBA sector size */
+	sector_sz = (1UL << nvme_ns->lba_shift);
+	if (((karg.fpos | karg.length | karg.offset) & (sector_sz - 1)) != 0)
+	{
+		prError("alignment violation {fpos=%zu, length=%zu, offset=%zu}",
+				(size_t)karg.fpos, (size_t)karg.length, (size_t)karg.offset);
+		retval = -EINVAL;
+		goto error_1;
+	}
+
+	/* allocation of nvme_iod */
+	iod = nvme_alloc_iod(karg.length,
+						 nvme_ns->dev,
+						 GFP_KERNEL);
+	if (!iod)
+	{
+		retval = -ENOMEM;
+		goto error_1;
+	}
+
+	/* write out for each page */
+	cur = karg.offset;
+	len = karg.length;
+	pos = karg.fpos;
+	idx = 0;
+	while (len > 0)
+	{
+		struct buffer_head bh;
+		sector_t		lba_curr;
+		unsigned int	nr_blocks;
+		struct page	   *bpage = bstate->pages[cur >> PAGE_SHIFT];
+		phys_addr_t		bpage_addr = page_to_phys(bpage);
+		size_t			bpage_ofs = (cur & (PAGE_SIZE - 1));
+		size_t			file_ofs = (pos & (PAGE_SIZE - 1));
+		size_t			copy_len = len;
+
+		/*
+		 * TODO: we may need to update relevant page cache if any
+		 */
+
+		if (bpage_ofs + copy_len >= PAGE_SIZE)
+			copy_len = PAGE_SIZE - bpage_ofs;
+		if (file_ofs + copy_len >= PAGE_SIZE)
+			copy_len = PAGE_SIZE - file_ofs;
+
+		/* lookup the underlying destination block numbers */
+		memset(&bh, 0, sizeof(bh));
+		bh.b_size = i_sb->s_blocksize;
+
+		retval = strom_get_block(filp->f_inode,
+								 pos >> i_sb->s_blocksize_bits,
+								 &bh, 1);
+		if (retval)
+		{
+			prError("strom_get_block = %ld", retval);
+			goto error_1;
+		}
+		lba_curr = bh.b_blocknr + (file_ofs >> i_sb->s_blocksize_bits);
+		nr_blocks = (copy_len >> i_sb->s_blocksize_bits);
+
+		/* if we can merge next i/o with existing iod, merge it */
+		/* elsewhere, submit a pending write i/o once, then construct
+		 * a new iod request again */
+		/* call nvme_submit_async_write_cmd()? */
+
+		Assert(len >= copy_len);
+		len -= copy_len;
+		cur += copy_len;
+		pos += copy_len;
+	}
+
+
+
+
 	return -ENOTSUPP;
+
+error_1:
+	fput(filp);
+	return retval;
 }
 
 /*
@@ -155,6 +259,12 @@ pgblitz_ioctl__write_file(BlitzCmd__WriteFile __user *uarg)
 static long
 pgblitz_ioctl__flush_file(BlitzCmd__FlushFile __user *uarg)
 {
+	BlitzCmd__FlushFile karg;
+
+	if (copy_from_user(&karg, uarg, sizeof(BlitzCmd__FlushFile)))
+		return -EFAULT;
+
+
 	return -ENOTSUPP;
 }
 
@@ -340,6 +450,7 @@ pgblitz_file_ioctl(struct file *ioctl_filp,
                  unsigned int cmd,
                  unsigned long uarg)
 {
+	pgblitz_buffer_state *bstate;
 	long	retval;
 
 	switch (cmd)
@@ -351,7 +462,11 @@ pgblitz_file_ioctl(struct file *ioctl_filp,
 			retval = pgblitz_ioctl__check_file((void __user *)uarg);
 			break;
 		case BLITZ_IOCTL__WRITE_FILE:
-			retval = pgblitz_ioctl__write_file((void __user *)uarg);
+			bstate = pgblitz_get_buffer(ioctl_filp);
+			if (bstate)
+				retval = pgblitz_ioctl__write_file((void __user *)uarg, bstate);
+			else
+				retval = -ENODEV;
 			break;
 		case BLITZ_IOCTL__WRITE_FILE_ASYNC:
 			retval = -ENOTSUPP;
