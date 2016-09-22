@@ -1,0 +1,2 @@
+KERNEL=="pg_blitz[0-9]*", OWNER="root", GROUP="root", MODE="0644"
+

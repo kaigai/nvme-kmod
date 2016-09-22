@@ -10,6 +10,7 @@
 #error Linux kernel must be built with CONFIG_KALLSYMS
 #endif
 
+#ifdef EXTRA_KSYMS_NEEDS_NVIDIA
 /* nvidia_p2p_get_pages */
 static struct module *mod_nvidia_p2p_get_pages = NULL;
 static int (* p_nvidia_p2p_get_pages)(
@@ -72,6 +73,7 @@ __nvidia_p2p_free_page_table(struct nvidia_p2p_page_table *page_table)
 	BUG_ON(!p_nvidia_p2p_free_page_table);
 	return p_nvidia_p2p_free_page_table(page_table);
 }
+#endif	/* EXTRA_KSYMS_NEEDS_NVIDIA */
 
 /* ext4_get_block */
 static struct module *mod_ext4_get_block = NULL;
@@ -219,11 +221,14 @@ static struct notifier_block nvme_strom_nb = {
 static inline void
 strom_put_all_extra_modules(void)
 {
+#ifdef EXTRA_KSYMS_NEEDS_NVIDIA
+	/* nvidia */
 	module_put(mod_nvidia_p2p_get_pages);
 	module_put(mod_nvidia_p2p_put_pages);
 	module_put(mod_nvidia_p2p_free_page_table);
 	module_put(mod_ext4_get_block);
 	module_put(mod_xfs_get_blocks);
+#endif
 	/* nvme */
 	module_put(mod_nvme_submit_io_cmd);
 	module_put(mod_nvme_setup_prps);
@@ -259,10 +264,13 @@ strom_init_extra_symbols(void)
 			goto cleanup;										\
 	} while(0)
 
+#ifdef EXTRA_KSYMS_NEEDS_NVIDIA
 	/* nvidia.ko */
 	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvidia_p2p_get_pages);
 	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvidia_p2p_put_pages);
 	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvidia_p2p_free_page_table);
+#endif	/* EXTRA_KSYMS_NEEDS_NVIDIA */
+	/* nvme.ko */
 	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvme_free_iod);
 	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvme_submit_io_cmd);
 	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvme_setup_prps);

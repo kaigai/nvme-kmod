@@ -87,7 +87,8 @@ MODULE_PARM_DESC(verbose, "turn on/off debug message");
 	} while(0)
 
 /* routines for extra symbols */
-#include "extra_ksyms.c"
+#define EXTRA_KSYMS_NEEDS_NVIDIA	1
+#include "../common/extra_ksyms.c"
 
 /*
  * for boundary alignment requirement
