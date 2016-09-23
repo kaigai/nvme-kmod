@@ -64,27 +64,14 @@ MODULE_PARM_DESC(verbose, "turn on/off debug message");
 		else if (verbose)												\
 			printk(KERN_ALERT "nvme-strom: " fmt "\n", ##__VA_ARGS__);	\
 	} while(0)
-
-#define prInfo(fmt, ...)												\
-	do {																\
-		if (verbose)													\
-			printk(KERN_INFO "nvme-strom: " fmt "\n", ##__VA_ARGS__);	\
-	} while(0)
-
-#define prNotice(fmt, ...)												\
-	do {																\
-		printk(KERN_NOTICE "nvme-strom: " fmt "\n", ##__VA_ARGS__);		\
-	} while(0)
-
+#define prInfo(fmt, ...)						\
+	printk(KERN_INFO "nvme-strom: " fmt "\n", ##__VA_ARGS__)
+#define prNotice(fmt, ...)						\
+	printk(KERN_NOTICE "nvme-strom: " fmt "\n", ##__VA_ARGS__)
 #define prWarn(fmt, ...)						\
-	do {																\
-		printk(KERN_WARNING "nvme-strom: " fmt "\n", ##__VA_ARGS__);	\
-	} while(0)
-
-#define prError(fmt, ...)												\
-	do {																\
-		printk(KERN_ERR "nvme-strom: " fmt "\n", ##__VA_ARGS__);		\
-	} while(0)
+	printk(KERN_WARNING "nvme-strom: " fmt "\n", ##__VA_ARGS__)
+#define prError(fmt, ...)						\
+	printk(KERN_ERR "nvme-strom: " fmt "\n", ##__VA_ARGS__)
 
 /* routines for extra symbols */
 #define EXTRA_KSYMS_NEEDS_NVIDIA	1
@@ -215,11 +202,9 @@ strom_put_mapped_gpu_memory(mapped_gpu_memory *mgmem)
 	Assert(mgmem->refcnt > 0);
 	if (--mgmem->refcnt == 0)
 	{
-		if (mgmem->wait_task != NULL)
-		{
+		if (mgmem->wait_task)
 			wake_up_process(mgmem->wait_task);
-			mgmem->wait_task = NULL;
-		}
+		mgmem->wait_task = NULL;
 	}
 	spin_unlock_irqrestore(lock, flags);
 }
@@ -853,7 +838,7 @@ strom_put_dma_task(strom_dma_task *dtask, long dma_status)
 
 		fput(ioctl_filp);
 
-		prInfo("DMA task (id=%p) was completed", dtask);
+		prDebug("DMA task (id=%p) was completed", dtask);
 
 		return;
 	}
@@ -1771,7 +1756,7 @@ int	__init nvme_strom_init(void)
 		proc_remove(nvme_strom_proc);
 		return rc;
 	}
-	prInfo("/proc/nvme-strom entry was registered");
+	prNotice("/proc/nvme-strom entry was registered");
 
 	return 0;
 }
@@ -1781,7 +1766,7 @@ void __exit nvme_strom_exit(void)
 {
 	strom_exit_extra_symbols();
 	proc_remove(nvme_strom_proc);
-	prInfo("/proc/nvme-strom entry was unregistered");
+	prNotice("/proc/nvme-strom entry was unregistered");
 }
 module_exit(nvme_strom_exit);
 
