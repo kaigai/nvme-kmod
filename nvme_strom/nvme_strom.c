@@ -855,30 +855,31 @@ callback_ram2gpu_memcpy(struct work_struct *work)
 	strom_dma_task	   *dtask = mc_task->dtask;
 	mapped_gpu_memory  *mgmem = dtask->mgmem;
 	nvidia_p2p_page_table_t *page_table = mgmem->page_table;
-	size_t				dest_offset = mc_task->offset;
-	char			   *dest_iomap = NULL;
-	int					dest_index = -1;
-	size_t				page_ofs = mc_task->page_ofs;
-	size_t				page_len;
-	size_t				copy_len = mc_task->copy_len;
-	int					i, j;
-	long				status = 0;
+	size_t		dest_offset = mc_task->offset;
+	char	   *dest_iomap = NULL;
+	int			dest_index = -1;
+	size_t		cur = mc_task->page_ofs;
+	size_t		end = mc_task->page_ofs + mc_task->copy_len;
+	int			i, j;
+	long		status = 0;
 
 	Assert((mc_task->page_ofs +
 			mc_task->copy_len +
 			PAGE_CACHE_SIZE - 1) >> PAGE_CACHE_SHIFT == mc_task->nr_fpages);
 
-	for (i=0; i < mc_task->nr_fpages; i++)
+	while (cur < end)
 	{
-		struct page	   *fpage = mc_task->file_pages[i];
+		struct page	   *fpage = mc_task->file_pages[cur >> PAGE_CACHE_SHIFT];
+		size_t			page_ofs = (cur & (PAGE_CACHE_SIZE - 1));
+		size_t			page_len;
 		uint64_t		phy_addr;
 		char		   *saddr;
 		char		   *daddr;
 
 		/* length to copy from this page */
-		page_len = Min(PAGE_CACHE_SIZE, copy_len) - page_ofs;
+		page_len = Min(PAGE_CACHE_SIZE, end - (cur & PAGE_MASK)) - page_ofs;
 
-		/* map destination GPU page with write-combined mode */
+		/* map destination GPU page using write-combined mode */
 		j = dest_offset >> mgmem->gpu_page_shift;
 		if (!dest_iomap || j != dest_index)
 		{
@@ -888,31 +889,34 @@ callback_ram2gpu_memcpy(struct work_struct *work)
 			dest_iomap = ioremap_wc(phy_addr, mgmem->gpu_page_sz);
 			if (!dest_iomap)
 			{
-				while (i < mc_task->nr_fpages)
-				{
-					unlock_page(mc_task->file_pages[i]);
-					page_cache_release(mc_task->file_pages[i]);
-					i++;
-				}
 				status = -ENOMEM;
 				break;
 			}
 			dest_index = j;
 		}
+		/* choose shorter page_len if it comes across GPU page boundary */
+		if (j != ((dest_offset + page_len) >> mgmem->gpu_page_shift))
+		{
+			page_len = (mgmem->gpu_page_sz -
+						(dest_offset & (mgmem->gpu_page_sz - 1)));
+		}
+		/* do copy by CPU */
 		daddr = dest_iomap + (dest_offset & (mgmem->gpu_page_sz - 1));
 		saddr = kmap_atomic(fpage);
+
 		memcpy_toio(daddr, saddr + page_ofs, page_len);
 		kunmap_atomic(saddr);
 
-		unlock_page(fpage);
-		page_cache_release(fpage);
-
+		cur += page_len;
 		dest_offset += page_len;
-		copy_len -= page_len;
-		page_ofs = 0;
 	}
-	Assert(copy_len == 0);
-
+	Assert(cur == end || status != 0);
+	/* release resources */
+	for (i=0; i < mc_task->nr_fpages; i++)
+	{
+		unlock_page(mc_task->file_pages[i]);
+		page_cache_release(mc_task->file_pages[i]);
+	}
 	if (dest_iomap)
 		iounmap(dest_iomap);
 
