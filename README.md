@@ -11,10 +11,10 @@ and (2) launch P2P DMA from the source file blocks to the mapped GPU device
 memory without intermediation by the main memory.
 
 * Requirements
-** NVIDIA Tesla or Quadro GPU
-** NVMe SSD
-** Red Hat Enterprise Linux 7.x, or compatible kernel
-** Ext4 or XFS filesystem on the raw block device
+    * NVIDIA Tesla or Quadro GPU
+    * NVMe SSD
+    * Red Hat Enterprise Linux 7.x, or compatible kernel
+    * Ext4 or XFS filesystem on the raw block device
 
 
 PG-Blitz
@@ -27,7 +27,7 @@ It enables to submit i/o request without additional buffer copy and extra
 abstruction by VFS.
 
 * Requirements
-** NVMe SSD
-** Red Hat Enterprise Linux 7.x, or compatible kernel
-** Ext4 or XFS filesystem on the raw block device
+    * NVMe SSD
+    * Red Hat Enterprise Linux 7.x, or compatible kernel
+    * Ext4 or XFS filesystem on the raw block device
 
