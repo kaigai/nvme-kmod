@@ -151,14 +151,12 @@ callback_dma_wait(CUstream cuda_stream, CUresult status, void *private)
 
 	cuda_exit_on_error(status, "async_task");
 
-	uarg.ntasks = 1;
-	uarg.nwaits = 1;
-	uarg.dma_task_id[0] = atask->dma_task_id;
+	memset(&uarg, 0, sizeof(StromCmd__MemCpySsdToGpuWait));
+	uarg.dma_task_id = atask->dma_task_id;
 	rv = nvme_strom_ioctl(STROM_IOCTL__MEMCPY_SSD2GPU_WAIT, &uarg);
 	if (uarg.status)
 		printf("async dma (id=%lu, status=%ld)\n",
-			   uarg.nwaits > 0 ? uarg.dma_task_id[0] : 0,
-			   uarg.status);
+			   uarg.dma_task_id, uarg.status);
 	system_exit_on_error(rv, "STROM_IOCTL__MEMCPY_SSD2GPU_WAIT");
 }
 

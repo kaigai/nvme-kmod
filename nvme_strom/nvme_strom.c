@@ -675,10 +675,11 @@ struct strom_memcpy_task
 };
 typedef struct strom_memcpy_task	strom_memcpy_task;
 
-#define STROM_DMA_TASK_NSLOTS		100
+#define STROM_DMA_TASK_NSLOTS		240
 static spinlock_t		strom_dma_task_locks[STROM_DMA_TASK_NSLOTS];
 static struct list_head	strom_dma_task_slots[STROM_DMA_TASK_NSLOTS];
 static struct list_head	failed_dma_task_slots[STROM_DMA_TASK_NSLOTS];
+static wait_queue_head_t strom_dma_task_waitq[STROM_DMA_TASK_NSLOTS];
 
 /*
  * strom_dma_task_index
@@ -816,7 +817,9 @@ strom_put_dma_task(strom_dma_task *dtask, long dma_status)
 
 	if (--dtask->refcnt == 0)
 	{
+		mapped_gpu_memory *mgmem = dtask->mgmem;
 		struct file	   *ioctl_filp = dtask->ioctl_filp;
+		struct file	   *data_filp = dtask->filp;
 		long			status = dtask->dma_status;
 
 		/* detach from the global hash table */
@@ -828,14 +831,13 @@ strom_put_dma_task(strom_dma_task *dtask, long dma_status)
 			list_add_tail(slot, &dtask->chain);
 		}
 		/* wake up all the waiting tasks, if any */
-		wake_up_all(&dtask->wait_tasks);
+		wake_up_all(&strom_dma_task_waitq[index]);
+		spin_unlock_irqrestore(lock, flags);
 		/* release relevant resources */
-		strom_put_mapped_gpu_memory(dtask->mgmem);
-		fput(dtask->filp);
 		if (!status)
 			kfree(dtask);
-		spin_unlock_irqrestore(lock, flags);
-
+		strom_put_mapped_gpu_memory(mgmem);
+		fput(data_filp);
 		fput(ioctl_filp);
 
 		prDebug("DMA task (id=%p) was completed", dtask);
@@ -1080,210 +1082,67 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 /*
  * strom_memcpy_ssd2gpu_wait - synchronization of a dma_task
  */
-typedef struct strom_dma_wait
-{
-	wait_queue_t		waitq;
-	strom_dma_task	   *dtask;
-} strom_dma_wait;
-
 static int
-ssd2gpu_wait_wakeup_callback(wait_queue_t *waitq, unsigned int mode,
-							 int wake_flags, void *key)
+strom_memcpy_ssd2gpu_wait(unsigned long dma_task_id,
+						  long *p_dma_task_status,
+						  int task_state)
 {
-	/*
-	 * NOTE: This function shall be called under the strom_dma_task_locks
-	 * and wait_queue_head_t->lock, thus, we must no acquire these locks
-	 * again. In addition, strom_dma_task should exist; just before kfree().
-	 */
-	strom_dma_wait	   *dwait = (strom_dma_wait *) waitq;
-	strom_dma_task	   *dtask = dwait->dtask;
-
-	__remove_wait_queue(&dtask->wait_tasks, waitq);
-
-	return default_wake_function(waitq, mode, wake_flags, key);
-}
-
-static int
-strom_memcpy_ssd2gpu_wait(unsigned int ntasks,
-						  unsigned int nwaits,
-						  unsigned long *dma_task_ids,
-						  unsigned long *p_failed_dma_task_id,
-						  long *p_failed_dma_status)
-{
-	strom_dma_wait		__dma_wait_data[10];
-	strom_dma_wait	   *dma_wait_data;
-	strom_dma_wait	   *__dma_wait[10];
-	strom_dma_wait	  **dma_wait;
-	strom_dma_wait	   *dwait;
-	strom_dma_task	   *dtask;
-	unsigned long		dma_task_id;
+	int					hindex = strom_dma_task_index(dma_task_id);
+	spinlock_t		   *lock = &strom_dma_task_locks[hindex];
 	unsigned long		flags;
-	spinlock_t		   *lock;
+	strom_dma_task	   *dtask;
 	struct list_head   *slot;
-	bool				first_try = true;
-	int					wq_index = 0;
-	int					w_index = 0;
-	int					r_index;
-	int					hindex;
+	wait_queue_head_t  *waitq = &strom_dma_task_waitq[hindex];
 	int					retval = 0;
 
-	if (ntasks < nwaits)
-		return -EINVAL;
-	if (nwaits == 0)
-	{
-		/*
-		 * TODO: If nwaits==0, it does not block any tasks but check completed
-		 * tasks.
-		 */
-		return -EINVAL;
-	}
+	DEFINE_WAIT(__wait);
 
-	/* temporary buffer for wait queue */
-	if (ntasks <= lengthof(__dma_wait_data))
-	{
-		/* skip kmalloc for small ntasks */
-		dma_wait_data = __dma_wait_data;
-		dma_wait = __dma_wait;
-	}
-	else
-	{
-		dma_wait_data = kmalloc(sizeof(strom_dma_wait) * ntasks, GFP_KERNEL);
-		dma_wait = kmalloc(sizeof(strom_dma_wait *) * ntasks, GFP_KERNEL);
-		if (!dma_wait_data || !dma_wait)
-		{
-			kfree(dma_wait_data);
-			kfree(dma_wait);
-			return -ENOMEM;
-		}
-	}
-	memset(dma_wait_data, 0, sizeof(strom_dma_wait) * ntasks);
-	memset(dma_wait, 0, sizeof(strom_dma_wait *) * ntasks);
-
-	prDebug("Begin strom_memcpy_ssd2gpu_wait(ntasks=%u, nwaits=%u)",
-			ntasks, nwaits);
 	for (;;)
 	{
-		set_current_state(TASK_INTERRUPTIBLE);
+		prepare_to_wait(waitq, &__wait, task_state);
 
-		for (r_index = w_index; r_index < ntasks; r_index++)
+		spin_lock_irqsave(lock, flags);
+		/* check error status first */
+		slot = &failed_dma_task_slots[hindex];
+		list_for_each_entry(dtask, slot, chain)
 		{
-			dma_task_id = dma_task_ids[r_index];
-			hindex = strom_dma_task_index(dma_task_id);
-
-			lock = &strom_dma_task_locks[hindex];
-			spin_lock_irqsave(lock, flags);
-
-			/*
-			 * Look up failed DMA tasks first to pick up its error status
-			 * and return it immediately, if any.
-			 */
-			slot = &failed_dma_task_slots[hindex];
-			list_for_each_entry(dtask, slot, chain)
+			if (dtask->dma_task_id == dma_task_id)
 			{
-				if (dtask->dma_task_id == dma_task_id)
-				{
-					/* error tasks are already done */
-					dma_task_ids[r_index] = dma_task_ids[w_index];
-					dma_task_ids[w_index] = dma_task_id;
-					dma_wait[r_index] = dma_wait[w_index];
-					dma_wait[w_index] = NULL;
+				if (p_dma_task_status)
+					*p_dma_task_status = dtask->dma_status;
+				list_del(&dtask->chain);
+				kfree(dtask);
 
-					/* reclaim the error status */
-					if (p_failed_dma_task_id)
-						*p_failed_dma_task_id = dma_task_id;
-					if (p_failed_dma_status)
-						*p_failed_dma_status = dtask->dma_status;
-					list_del(&dtask->chain);
-					kfree(dtask);
-
-					/* up to one dma_task can be synchronized */
-					retval = -EIO;
-					goto bailout;
-				}
+				spin_unlock_irqrestore(lock, flags);
+				retval = -EIO;
+				goto out;
 			}
-
-			/*
-			 * OK, this DMA task either still running or successfully done.
-			 */
-			slot = &strom_dma_task_slots[hindex];
-			list_for_each_entry(dtask, slot, chain)
-			{
-				/* Hmm, this task is still in-progress */
-				if (dtask->dma_task_id == dma_task_id)
-				{
-					if (first_try)
-					{
-						/* see init_waitqueue_entry */
-						dwait = &dma_wait_data[wq_index++];
-						dwait->waitq.flags = 0;
-						dwait->waitq.private = current;
-						dwait->waitq.func = ssd2gpu_wait_wakeup_callback;
-						dwait->dtask = dtask;
-						add_wait_queue(&dtask->wait_tasks, &dwait->waitq);
-						dma_wait[r_index] = dwait;
-					}
-					goto found;
-				}
-			}
-			/* move the completed tasks to the earlier half */
-			dma_task_ids[r_index] = dma_task_ids[w_index];
-			dma_task_ids[w_index] = dma_task_id;
-			dma_wait[r_index] = dma_wait[w_index];
-			dma_wait[w_index] = NULL;
-			w_index++;
-		found:
-			spin_unlock_irqrestore(lock, flags);
 		}
 
-		if (w_index >= nwaits)
-			break;
-
+		/* check whether it is a running task or not */
+		slot = &strom_dma_task_slots[hindex];
+		list_for_each_entry(dtask, slot, chain)
+		{
+			if (dtask->dma_task_id == dma_task_id)
+			{
+				spin_unlock_irqrestore(lock, flags);
+				goto found;
+			}
+		}
+		spin_unlock_irqrestore(lock, flags);
+		break;
+	found:
 		if (signal_pending(current))
 		{
 			retval = -EINTR;
 			break;
 		}
-		/* sleep until somebody kicks me */
 		schedule();
-
-		first_try = false;
 	}
-bailout:
-	/* revert current task status */
-	set_current_state(TASK_RUNNING);
+out:
+	finish_wait(waitq, &__wait);
 
-	/*
-	 * Remove the current context from wait-queue of the DMA task which
-	 * is still running.
-	 */
-	for (r_index = w_index; r_index < ntasks; r_index++)
-	{
-		dma_task_id = dma_task_ids[r_index];
-		hindex = strom_dma_task_index(dma_task_id);
-
-		lock = &strom_dma_task_locks[hindex];
-		slot = &strom_dma_task_slots[hindex];
-
-		spin_lock_irqsave(lock, flags);
-		list_for_each_entry(dtask, slot, chain)
-		{
-			if (dtask->dma_task_id == dma_task_id)
-			{
-				dwait = dma_wait[r_index];
-				if (dwait)
-					remove_wait_queue(&dtask->wait_tasks, &dwait->waitq);
-				break;
-			}
-		}
-		spin_unlock_irqrestore(lock, flags);
-	}
-
-	/* cleanup */
-	if (dma_wait != __dma_wait)
-		kfree(dma_wait);
-	if (dma_wait_data != __dma_wait_data)
-		kfree(dma_wait_data);
-	return (retval < 0 ? retval : w_index);
+	return retval;
 }
 
 /*
@@ -1548,14 +1407,8 @@ ioctl_memcpy_ssd2gpu_async(StromCmd__MemCpySsdToGpu __user *uarg,
 		retval = -EFAULT;
 	/* synchronization if necessary */
 	if (retval || do_sync)
-	{
-		while (strom_memcpy_ssd2gpu_wait(1, 1, &dma_task_id,
-										 NULL, NULL) == -EINTR)
-		{
-			prNotice("dma_task_id=%p was interrupted by a signel",
-					 (void *)dma_task_id);
-		}
-	}
+		strom_memcpy_ssd2gpu_wait(dma_task_id, NULL, TASK_UNINTERRUPTIBLE);
+
 	kfree(dchunks);
 
 	return retval;
@@ -1568,79 +1421,19 @@ static int
 ioctl_memcpy_ssd2gpu_wait(StromCmd__MemCpySsdToGpuWait __user *uarg,
 						  struct file *ioctl_filp)
 {
-	StromCmd__MemCpySsdToGpuWait	__karg;
-	StromCmd__MemCpySsdToGpuWait   *karg;
-	unsigned long	failed_dma_task_id = 0;
-	long			failed_dma_status;
-	long			retval;
+	StromCmd__MemCpySsdToGpuWait karg;
+	long		retval;
 
-	if (copy_from_user(&__karg, uarg,
-					   offsetof(StromCmd__MemCpySsdToGpuWait, dma_task_id)))
+	if (copy_from_user(&karg, uarg, sizeof(StromCmd__MemCpySsdToGpuWait)))
 		return -EFAULT;
 
-	if (__karg.ntasks == 0 || __karg.ntasks < __karg.nwaits)
-		return -EINVAL;
-	else if (__karg.ntasks == 1)
-	{
-		if (get_user(__karg.dma_task_id[0], &uarg->dma_task_id[0]))
-			return -EFAULT;
-		karg = &__karg;
-	}
-	else
-	{
-		karg = kmalloc(offsetof(StromCmd__MemCpySsdToGpuWait,
-								dma_task_id[__karg.ntasks]),
-					   GFP_KERNEL);
-		if (!karg)
-			return -ENOMEM;
-		karg->ntasks = __karg.ntasks;
-		karg->nwaits = __karg.nwaits;
-		if (copy_from_user(karg->dma_task_id,
-						   uarg->dma_task_id,
-						   sizeof(unsigned long) * __karg.ntasks))
-		{
-			kfree(karg);
-			return -EFAULT;
-		}
-	}
+	karg.status = 0;
+	retval = strom_memcpy_ssd2gpu_wait(karg.dma_task_id,
+									   &karg.status,
+									   TASK_INTERRUPTIBLE);
+	if (copy_to_user(uarg, &karg, sizeof(StromCmd__MemCpySsdToGpuWait)))
+		return -EFAULT;
 
-	retval = strom_memcpy_ssd2gpu_wait(karg->ntasks,
-									   karg->nwaits,
-									   karg->dma_task_id,
-									   &failed_dma_task_id,
-									   &failed_dma_status);
-	if (retval >= 0)
-	{
-		karg->nwaits = retval;
-		karg->status = 0;
-		if (retval > 0 &&
-			copy_to_user(uarg, karg,
-						 offsetof(StromCmd__MemCpySsdToGpuWait,
-								  dma_task_id[karg->nwaits])))
-			retval = -EFAULT;
-		retval = 0;
-	}
-	else
-	{
-		if (!failed_dma_task_id)
-		{
-			karg->nwaits = 0;
-			karg->status = 0;
-		}
-		else
-		{
-			karg->nwaits = 1;
-			karg->status = failed_dma_status;
-			karg->dma_task_id[0] = failed_dma_task_id;
-		}
-		if (copy_to_user(uarg, karg,
-						 offsetof(StromCmd__MemCpySsdToGpuWait,
-                                  dma_task_id[karg->nwaits])))
-			retval = -EFAULT;
-	}
-
-	if (karg != &__karg)
-		kfree(karg);
 	return retval;
 }
 
@@ -1787,6 +1580,7 @@ int	__init nvme_strom_init(void)
 		spin_lock_init(&strom_dma_task_locks[i]);
 		INIT_LIST_HEAD(&strom_dma_task_slots[i]);
 		INIT_LIST_HEAD(&failed_dma_task_slots[i]);
+		init_waitqueue_head(&strom_dma_task_waitq[i]);
 	}
 
 	/* make "/proc/nvme-strom" entry */
