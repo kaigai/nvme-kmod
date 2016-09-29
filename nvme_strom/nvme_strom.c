@@ -625,9 +625,6 @@ struct strom_dma_task
 	sector_t			start_sect;	/* first sector of the source partition */
 	sector_t			nr_sects;	/* number of sectors of the partition */
 
-	/* waitq for the tasks that are waiting this DMA task */
-	wait_queue_head_t	wait_tasks;
-
 	/*
 	 * status of asynchronous tasks
 	 *
@@ -750,7 +747,6 @@ strom_create_dma_task(unsigned long handle,
 	Assert(dtask->blocksz == (1UL << dtask->blocksz_shift));
 	dtask->start_sect	= s_bdev->bd_part->start_sect;
 	dtask->nr_sects		= s_bdev->bd_part->nr_sects;
-    init_waitqueue_head(&dtask->wait_tasks);
     dtask->dma_status	= 0;
     dtask->ioctl_filp	= get_file(ioctl_filp);
 
@@ -764,7 +760,7 @@ strom_create_dma_task(unsigned long handle,
 
     /* OK, this strom_dma_task is now tracked */
 	spin_lock_irqsave(&strom_dma_task_locks[dtask->hindex], flags);
-	list_add(&dtask->chain, &strom_dma_task_slots[dtask->hindex]);
+	list_add_rcu(&dtask->chain, &strom_dma_task_slots[dtask->hindex]);
     spin_unlock_irqrestore(&strom_dma_task_locks[dtask->hindex], flags);
 
 	return dtask;
@@ -823,7 +819,7 @@ strom_put_dma_task(strom_dma_task *dtask, long dma_status)
 		long			status = dtask->dma_status;
 
 		/* detach from the global hash table */
-		list_del(&dtask->chain);
+		list_del_rcu(&dtask->chain);
 		/* if any error status, move to the ioctl_filp without kfree() */
 		if (status)
 		{
@@ -1096,42 +1092,54 @@ strom_memcpy_ssd2gpu_wait(unsigned long dma_task_id,
 	int					retval = 0;
 
 	DEFINE_WAIT(__wait);
-
 	for (;;)
 	{
+		bool	has_spinlock = false;
+		bool	task_is_running = false;
+
 		prepare_to_wait(waitq, &__wait, task_state);
 
-		spin_lock_irqsave(lock, flags);
+		rcu_read_lock();
+	retry:
 		/* check error status first */
 		slot = &failed_dma_task_slots[hindex];
-		list_for_each_entry(dtask, slot, chain)
+		list_for_each_entry_rcu(dtask, slot, chain)
 		{
 			if (dtask->dma_task_id == dma_task_id)
 			{
+				if (!has_spinlock)
+				{
+					rcu_read_unlock();
+					has_spinlock = true;
+					spin_lock_irqsave(lock, flags);
+					goto retry;
+				}
 				if (p_dma_task_status)
 					*p_dma_task_status = dtask->dma_status;
 				list_del(&dtask->chain);
 				kfree(dtask);
 
-				spin_unlock_irqrestore(lock, flags);
-				retval = -EIO;
 				goto out;
 			}
 		}
 
 		/* check whether it is a running task or not */
 		slot = &strom_dma_task_slots[hindex];
-		list_for_each_entry(dtask, slot, chain)
+		list_for_each_entry_rcu(dtask, slot, chain)
 		{
 			if (dtask->dma_task_id == dma_task_id)
 			{
-				spin_unlock_irqrestore(lock, flags);
-				goto found;
+				task_is_running = true;
+				break;
 			}
 		}
-		spin_unlock_irqrestore(lock, flags);
-		break;
-	found:
+		if (has_spinlock)
+			spin_unlock_irqrestore(lock, flags);
+		else
+			rcu_read_unlock();
+
+		if (!task_is_running)
+			break;
 		if (signal_pending(current))
 		{
 			retval = -EINTR;
