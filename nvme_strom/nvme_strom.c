@@ -1445,6 +1445,43 @@ ioctl_memcpy_ssd2gpu_wait(StromCmd__MemCpySsdToGpuWait __user *uarg,
 	return retval;
 }
 
+/*
+ * ioctl(2) handler for STROM_IOCTL__MEMCPY_SSD2GPU_WRITEBACK
+ */
+static int
+ioctl_memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack __user *uarg,
+							   struct file *ioctl_filp)
+{
+	StromCmd__MemCpySsdToGpuWriteBack karg;
+	loff_t	   *file_pos;
+	long		retval;
+
+	if (copy_from_user(&karg, uarg, offsetof(StromCmd__MemCpySsdToGpuWriteBack,
+											 file_pos)))
+		return -EFAULT;
+
+	file_pos = kmalloc(sizeof(loff_t) * karg.nchunks, GFP_KERNEL);
+	if (!file_pos)
+		return -ENOMEM;
+	if (copy_from_user(file_pos, uarg->file_pos,
+					   sizeof(loff_t) * karg.nchunks))
+	{
+		kfree(file_pos);
+		return -EFAULT;
+	}
+
+	// TODO: code the write-back mode
+	retval = -ENOTSUPP;
+
+	if (!retval &&
+		copy_to_user(uarg, &karg, offsetof(StromCmd__MemCpySsdToGpuWriteBack,
+										   handle)))
+		retval = -EFAULT;
+
+	kfree(file_pos);
+	return retval;
+}
+
 /* ================================================================
  *
  * file_operations of '/proc/nvme-strom' entry
@@ -1552,6 +1589,11 @@ strom_proc_ioctl(struct file *ioctl_filp,
 		case STROM_IOCTL__MEMCPY_SSD2GPU_WAIT:
 			retval = ioctl_memcpy_ssd2gpu_wait((void __user *) arg,
 											   ioctl_filp);
+			break;
+
+		case STROM_IOCTL__MEMCPY_SSD2GPU_WRITEBACK:
+			retval = ioctl_memcpy_ssd2gpu_writeback((void __user *) arg,
+													ioctl_filp);
 			break;
 
 		default:
