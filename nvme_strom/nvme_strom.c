@@ -1450,7 +1450,7 @@ ioctl_memcpy_ssd2gpu_wait(StromCmd__MemCpySsdToGpuWait __user *uarg,
  */
 static int
 do_memcpy_ssd2gpu_writeback(strom_dma_task *dtask,
-							size_t dest_offset,
+							size_t buffer_offset,
 							size_t chunk_size,
 							int nchunks,
 							loff_t *file_pos
@@ -1461,13 +1461,14 @@ do_memcpy_ssd2gpu_writeback(strom_dma_task *dtask,
 {
 	mapped_gpu_memory *mgmem = dtask->mgmem;
 	struct file	   *filp = dtask->filp;
-	loff_t			ram2gpu_offset = mgmem->map_offset + dest_offset;
+	loff_t			ram2gpu_offset = mgmem->map_offset + buffer_offset;
 	loff_t			ssd2gpu_offset = ram2gpu_offset + nchunks * chunk_size;
 	unsigned int	nr_ram2gpu = 0;
 	unsigned int	nr_ssd2gpu = 0;
 	unsigned int	n_pages = chunk_size >> PAGE_CACHE_SHIFT;
 	int				threshold = chunk_size >> PAGE_CACHE_SHIFT;
 	size_t			i_size;
+	int				retval = 0;
 	int				i, j;
 
 	/* sanity checks */
@@ -1502,23 +1503,72 @@ do_memcpy_ssd2gpu_writeback(strom_dma_task *dtask,
 
 		if (score > threshold)
 		{
+			loff_t		curr_offset = ram2gpu_offset;
+			char	   *kaddr;
+			size_t		left = ~0UL;
+
 			/* chunk shall be written back to user buffer */
 			for (j=0; j < n_pages; j++)
 			{
 				fpage = dtask->file_pages[j];
-				if (fpage)
+				/* Synchronous read, if not cached */
+				if (!fpage)
 				{
-					// kmap + memcpy
-
+					fpage = read_mapping_page(filp->f_mapping,
+											  ....);
+					if (IS_ERR(fpage))
+					{
+						retval = PTR_ERR(fpage);
+						break;
+					}
+					lock_page(fpage);
 				}
-				else
+				Assert(fpage != NULL);
+
+				/* write-back the pages to userspace, like file_read_actor() */
+				if (!fault_in_pages_writeable(user_addr, PAGE_CACHE_SIZE))
 				{
-					// SSD to RAM DMA?
-					// fpage read by VFS?
-
-
+					kaddr = kmap_atomic(fpage);
+					left = __copy_to_user_inatomic(user_addr,
+												   kaddr,
+												   PAGE_CACHE_SIZE);
+					kunmap_atomic(kaddr);
 				}
+				/* Do it by the slow way, if needed */
+				if (left)
+				{
+					kaddr = kmap(fpage);
+					left = __copy_to_user(user_addr, kaddr,
+										  PAGE_CACHE_SIZE);
+					kunmap(kaddr);
+				}
+				unlock_page(fpage);
+				page_cache_release(fpage);
+
+				/* Error? */
+				if (left)
+				{
+					retval = -EFAULT;
+					break;
+				}
+				curr_offset += PAGE_CACHE_SIZE;
 			}
+
+			/* Error? */
+			if (retval)
+			{
+				while (++j < n_pages)
+				{
+					fpage = dtask->file_pages[j];
+					if (fpage)
+					{
+						unlock_page(fpage);
+						page_cache_release(fpage);
+					}
+				}
+				return retval;
+			}
+			ram2gpu_offset += chunk_size;
 			nr_ram2gpu++;
 		}
 		else
