@@ -105,6 +105,8 @@ typedef struct StromCmd__MemCpySsdToGpuWriteBack
 	unsigned long	dma_task_id;/* out: ID of the DMA task */
 	unsigned int	nr_ram2gpu;	/* out: # of RAM2GPU chunks */
 	unsigned int	nr_ssd2gpu;	/* out: # of SSD2GPU chunks */
+	unsigned int	nr_dma_submit; /* out: # of SSD2GPU DMA submit */
+	unsigned int	nr_dma_blocks; /* out: # of SSD2GPU DMA blocks */
 	unsigned long	handle;		/* in: handle of the mapped GPU memory */
 	size_t			offset;		/* in: offset from the head of GPU memory */
 	size_t			block_size;	/* in: size of a block */

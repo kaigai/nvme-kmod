@@ -32,7 +32,7 @@
 #define offsetof(type, field)   ((long) &((type *)0)->field)
 #define Max(a,b)				((a) > (b) ? (a) : (b))
 #define Min(a,b)				((a) < (b) ? (a) : (b))
-#define BLCKSZ					8192
+#define BLCKSZ					(8192)
 
 /* command line options */
 static int		device_index = -1;
@@ -245,51 +245,59 @@ setup_async_tasks(int fdesc)
 
 static void
 show_throughput(const char *filename, size_t file_size,
-				struct timeval tv1, struct timeval tv2)
+				struct timeval tv1, struct timeval tv2,
+				long usec_sem_wait,
+				long nr_ram2gpu, long nr_ssd2gpu,
+				long nr_dma_submit, long nr_dma_blocks)
 {
 	long		time_ms;
 	double		throughput;
-	char		buf[256];
-	int			ofs = 0;
 
 	time_ms = ((tv2.tv_sec * 1000 + tv2.tv_usec / 1000) -
 			   (tv1.tv_sec * 1000 + tv1.tv_usec / 1000));
 	throughput = (double)file_size / ((double)time_ms / 1000.0);
 
 	if (file_size < (4UL << 10))
-		ofs += snprintf(buf+ofs, sizeof(buf)-ofs, "read: %zuBytes",
-						file_size);
+		printf("read: %zuBytes", file_size);
 	else if (file_size < (4UL << 20))
-		ofs += snprintf(buf+ofs, sizeof(buf)-ofs, "read: %.2fKB",
-						(double)file_size / (double)(1UL << 10));
+		printf("read: %.2fKB", (double)file_size / (double)(1UL << 10));
 	else if (file_size < (4UL << 30))
-		ofs += snprintf(buf+ofs, sizeof(buf)-ofs, "read: %.2fMB",
-						(double)file_size / (double)(1UL << 20));
+		printf("read: %.2fMB", (double)file_size / (double)(1UL << 20));
 	else
-		ofs += snprintf(buf+ofs, sizeof(buf)-ofs, "read: %.2fGB",
-						(double)file_size / (double)(1UL << 30));
+		printf("read: %.2fGB", (double)file_size / (double)(1UL << 30));
 
 	if (time_ms < 4000UL)
-		ofs += snprintf(buf+ofs, sizeof(buf)-ofs, ", time: %lums",
-						time_ms);
+		printf(", time: %lums", time_ms);
 	else
-		ofs += snprintf(buf+ofs, sizeof(buf)-ofs, ", time: %.2fsec",
-						(double)time_ms / 1000.0);
+		printf(", time: %.2fsec", (double)time_ms / 1000.0);
 
 	if (throughput < (double)(4UL << 10))
-		ofs += snprintf(buf+ofs, sizeof(buf)-ofs, ", throughput: %zuB/s",
-						(size_t)throughput);
+		printf(", throughput: %zuB/s\n", (size_t)throughput);
 	else if (throughput < (double)(4UL << 20))
-		ofs += snprintf(buf+ofs, sizeof(buf)-ofs, ", throughput: %.2fKB/s",
-						throughput / (double)(1UL << 10));
+		printf(", throughput: %.2fKB/s\n", throughput / (double)(1UL << 10));
 	else if (throughput < (double)(4UL << 30))
-		ofs += snprintf(buf+ofs, sizeof(buf)-ofs, ", throughput: %.2fMB/s",
-						throughput / (double)(1UL << 20));
+		printf(", throughput: %.2fMB/s\n", throughput / (double)(1UL << 20));
 	else
-		ofs += snprintf(buf+ofs, sizeof(buf)-ofs, ", throughput: %.2fGB/s",
-						throughput / (double)(1UL << 30));
+		printf(", throughput: %.2fGB/s\n", throughput / (double)(1UL << 30));
 
-	printf("file: %s, %s\n", filename, buf);
+	if (usec_sem_wait < 4000)
+		printf("sem_wait: %ldus", usec_sem_wait);
+	else if (usec_sem_wait < 4000 * 4000)
+		printf("sem_wait: %ldms", usec_sem_wait / 1000);
+	else
+		printf("sem_wait: %.2fsec", (double)usec_sem_wait / 1000000.0);
+
+	if (nr_ram2gpu > 0 || nr_ssd2gpu > 0)
+	{
+		printf(", nr_ram2gpu: %ld, nr_ssd2gpu: %ld",
+			   nr_ram2gpu, nr_ssd2gpu);
+	}
+	if (nr_dma_submit > 0)
+	{
+		printf(", average DMA blocks: %.2f",
+			   (double)nr_dma_blocks / (double)nr_dma_submit);
+	}
+	putchar('\n');
 }
 
 static void
@@ -299,13 +307,18 @@ exec_test_by_strom(CUdeviceptr cuda_devptr, unsigned long handle,
 	StromCmd__MemCpySsdToGpuWriteBack *uarg;
 	async_task	   *async_tasks;
 	CUresult		rc;
-	int				nchunks = chunk_size / BLCKSZ;
 	int				i, j, rv;
 	size_t			offset;
 	struct timeval	tv1, tv2;
+	struct timeval	wt1, wt2;
+	long			usec_sem_wait = 0;
+	long			nr_ram2gpu = 0;
+	long			nr_ssd2gpu = 0;
+	long			nr_dma_submit = 0;
+	long			nr_dma_blocks = 0;
 
 	uarg = malloc(offsetof(StromCmd__MemCpySsdToGpuWriteBack,
-						   file_pos[nchunks]));
+						   file_pos[chunk_size / BLCKSZ]));
 	system_exit_on_error(!uarg, "out of memory");
 
 	async_tasks = setup_async_tasks(fdesc);
@@ -313,11 +326,15 @@ exec_test_by_strom(CUdeviceptr cuda_devptr, unsigned long handle,
 	for (offset=0; offset < file_size; offset += chunk_size)
 	{
 		async_task *atask = NULL;
+		int			nchunks = Min(file_size - offset, chunk_size) / BLCKSZ;
 
 		/* wait for DMA slot */
+		gettimeofday(&wt1, NULL);
 		rv = sem_wait(&buffer_sem);
 		system_exit_on_error(rv, "sem_wait");
-
+		gettimeofday(&wt2, NULL);
+		usec_sem_wait += ((wt2.tv_sec * 1000000 + wt2.tv_usec) -
+						  (wt1.tv_sec * 1000000 + wt1.tv_usec));
 		/* find out an available async_task */
 		pthread_mutex_lock(&buffer_lock);
 		for (j=0; j < num_chunks; j++)
@@ -341,7 +358,7 @@ exec_test_by_strom(CUdeviceptr cuda_devptr, unsigned long handle,
 		/* setup SSD-to-GPU DMA request */
 		memset(uarg, 0, sizeof(StromCmd__MemCpySsdToGpuWriteBack));
 		uarg->handle		= handle;
-		uarg->offset		= offset;
+		uarg->offset		= atask->index * chunk_size;
 		uarg->block_size	= BLCKSZ;
 		uarg->block_nums	= atask->block_nums;
 		uarg->block_data	= atask->src_buffer;
@@ -354,9 +371,13 @@ exec_test_by_strom(CUdeviceptr cuda_devptr, unsigned long handle,
 		}
 
 		rv = nvme_strom_ioctl(STROM_IOCTL__MEMCPY_SSD2GPU_WRITEBACK, uarg);
-		system_exit_on_error(rv, "STROM_IOCTL__MEMCPY_SSD2GPU_ASYNC");
+		system_exit_on_error(rv, "STROM_IOCTL__MEMCPY_SSD2GPU_WRITEBACK");
 		atask->dma_task_id    = uarg->dma_task_id;
 		atask->fpos           = offset;
+		nr_ram2gpu += uarg->nr_ram2gpu;
+		nr_ssd2gpu += uarg->nr_ssd2gpu;
+		nr_dma_submit += uarg->nr_dma_submit;
+		nr_dma_blocks += uarg->nr_dma_blocks;
 
 		/* kick RAM-to-GPU DMA, if written back */
 		if (uarg->nr_ram2gpu > 0)
@@ -390,9 +411,12 @@ exec_test_by_strom(CUdeviceptr cuda_devptr, unsigned long handle,
 	}
 	/* wait for completion of the asyncronous tasks */
 	do {
+		gettimeofday(&wt1, NULL);
 		rv = sem_wait(&buffer_sem);
 		system_exit_on_error(rv, "sem_wait");
-
+		gettimeofday(&wt2, NULL);
+		usec_sem_wait += ((wt2.tv_sec * 1000000 + wt2.tv_usec) -
+						  (wt1.tv_sec * 1000000 + wt1.tv_usec));
 		pthread_mutex_lock(&buffer_lock);
 		for (j=0; j < num_chunks; j++)
 		{
@@ -403,7 +427,10 @@ exec_test_by_strom(CUdeviceptr cuda_devptr, unsigned long handle,
 		pthread_mutex_unlock(&buffer_lock);
 	} while (j < num_chunks);
 	gettimeofday(&tv2, NULL);
-	show_throughput(filename, file_size, tv1, tv2);
+	show_throughput(filename, file_size, tv1, tv2,
+					usec_sem_wait,
+					nr_ram2gpu, nr_ssd2gpu,
+					nr_dma_submit, nr_dma_blocks);
 }
 
 static void
@@ -418,6 +445,8 @@ exec_test_by_vfs(CUdeviceptr cuda_devptr, unsigned long handle,
 	size_t			count;
 	ssize_t			retval;
 	struct timeval	tv1, tv2;
+	struct timeval	wt1, wt2;
+	long			usec_sem_wait = 0;
 
 	async_tasks = setup_async_tasks(fdesc);
 	gettimeofday(&tv1, NULL);
@@ -425,9 +454,12 @@ exec_test_by_vfs(CUdeviceptr cuda_devptr, unsigned long handle,
 	{
 		async_task *atask = NULL;
 
+		gettimeofday(&wt1, NULL);
 		rv = sem_wait(&buffer_sem);
 		system_exit_on_error(rv, "sem_wait");
-
+		gettimeofday(&wt2, NULL);
+		usec_sem_wait += ((wt1.tv_sec * 1000000 + wt2.tv_usec) -
+						  (wt2.tv_sec * 1000000 + wt2.tv_usec));
 		/* find out an available async_task */
 		pthread_mutex_lock(&buffer_lock);
 		for (j=0; j < num_chunks; j++)
@@ -483,8 +515,12 @@ exec_test_by_vfs(CUdeviceptr cuda_devptr, unsigned long handle,
 	}
 	/* wait for completion of the asyncronous tasks */
 	do {
+		gettimeofday(&wt1, NULL);
 		rv = sem_wait(&buffer_sem);
 		system_exit_on_error(rv, "sem_wait");
+		gettimeofday(&wt2, NULL);
+		usec_sem_wait += ((wt1.tv_sec * 1000000 + wt2.tv_usec) -
+						  (wt2.tv_sec * 1000000 + wt2.tv_usec));
 
 		pthread_mutex_lock(&buffer_lock);
 		for (j=0; j < num_chunks; j++)
@@ -497,7 +533,7 @@ exec_test_by_vfs(CUdeviceptr cuda_devptr, unsigned long handle,
 	} while (j < num_chunks);
 
 	gettimeofday(&tv2, NULL);
-	show_throughput(filename, file_size, tv1, tv2);
+	show_throughput(filename, file_size, tv1, tv2, usec_sem_wait, 0, 0, 0, 0);
 }
 
 /*

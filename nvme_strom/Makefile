@@ -6,9 +6,11 @@ NVME_STROM_BUILD_TIMESTAMP = $(shell date --utc)
 
 KERNEL_UNAME := $(shell uname -r)
 KERNEL_SOURCE := /lib/modules/$(KERNEL_UNAME)/build
+# MEMO: Older version of CUDA driver provided the kernel header files
+# at '/usr/src/nvidia-*/nv-p2p.h'.
 NVIDIA_SOURCE := $(shell ls -St /usr/src/nvidia-*/nv-p2p.h \
-                                /usr/src/nvidia-*/nvidia/nv-p2p.h | \
-                         sed 's/\/nv-p2p\.h$$//g' | head -1)
+                                /usr/src/nvidia-*/nvidia/nv-p2p.h 2>/dev/null \
+                       | sed 's/\/nv-p2p\.h$$//g' | head -1)
 
 CUDA_PATH_LIST := /usr/local/cuda /usr/local/cuda-*
 CUDA_PATH := $(shell for x in $(CUDA_PATH_LIST);    \
