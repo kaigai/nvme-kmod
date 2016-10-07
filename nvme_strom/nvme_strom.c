@@ -615,7 +615,8 @@ struct strom_dma_task
 	struct list_head	chain;
 	unsigned long		dma_task_id;/* ID of this DMA task */
 	int					hindex;		/* index of hash slot */
-	int					refcnt;		/* reference counter */
+	atomic_t			refcnt;		/* reference counter */
+	bool				frozen;		/* (DEBUG) no longer newly referenced */
 	mapped_gpu_memory  *mgmem;		/* destination GPU memory segment */
 	/* reference to the backing file */
 	struct file		   *filp;		/* source file */
@@ -741,7 +742,8 @@ strom_create_dma_task(unsigned long handle,
 	}
 	dtask->dma_task_id	= (unsigned long) dtask;
 	dtask->hindex		= strom_dma_task_index(dtask->dma_task_id);
-    dtask->refcnt		= 1;
+    atomic_set(&dtask->refcnt, 1);
+	dtask->frozen		= false;
     dtask->mgmem		= mgmem;
     dtask->filp			= filp;
 	dtask->nvme_ns		= nvme_ns;
@@ -782,14 +784,11 @@ error_0:
 static strom_dma_task *
 strom_get_dma_task(strom_dma_task *dtask)
 {
-	int				index = strom_dma_task_index(dtask->dma_task_id);
-	spinlock_t	   *lock = &strom_dma_task_locks[index];
-	unsigned long	flags;
+	int		refcnt_new;
 
-	spin_lock_irqsave(lock, flags);
-	Assert(dtask->refcnt > 0);
-	dtask->refcnt++;
-	spin_unlock_irqrestore(lock, flags);
+	Assert(!dtask->frozen);
+	refcnt_new = atomic_inc_return(&dtask->refcnt);
+	Assert(refcnt_new > 1);
 
 	return dtask;
 }
@@ -800,45 +799,47 @@ strom_get_dma_task(strom_dma_task *dtask)
 static void
 strom_put_dma_task(strom_dma_task *dtask, long dma_status)
 {
-	int					hindex = strom_dma_task_index(dtask->dma_task_id);
-	spinlock_t		   *lock = &strom_dma_task_locks[hindex];
-	struct list_head   *slot;
-	unsigned long		flags;
+	int					hindex = dtask->hindex;
+	unsigned long		flags = 0;
+	bool				has_spinlock = false;
 
-	spin_lock_irqsave(lock, flags);
-	Assert(dtask->refcnt > 0);
+	if (unlikely(dma_status))
+	{
+		spin_lock_irqsave(&strom_dma_task_locks[hindex], flags);
+		if (!dtask->dma_status)
+			dtask->dma_status = dma_status;
+		has_spinlock = true;
+	}
 
-	if (dma_status && !dtask->dma_status)
-		dtask->dma_status = dma_status;
-
-	if (--dtask->refcnt == 0)
+	if (atomic_dec_and_test(&dtask->refcnt))
 	{
 		mapped_gpu_memory *mgmem = dtask->mgmem;
 		struct file	   *ioctl_filp = dtask->ioctl_filp;
 		struct file	   *data_filp = dtask->filp;
-		long			dma_status = dtask->dma_status;
+		long			dma_status;
 
+		if (!has_spinlock)
+			spin_lock_irqsave(&strom_dma_task_locks[hindex], flags);
+		/* should be released after the final async job is submitted */
+		Assert(dtask->frozen);
+		/* fetch status under the lock */
+		dma_status = dtask->dma_status;
 		/* detach from the global hash table */
 		list_del_rcu(&dtask->chain);
-
-		/* On errors, dma_task shall be moved to failed_dma_task_slots[]
-		 * to reclaim the error code. So, dtask object is kept at this
-		 * moment.
-		 */
+		/* move to the error task list, if any error */
 		if (unlikely(dma_status))
 		{
 			dtask->ioctl_filp = NULL;
 			dtask->filp = NULL;
 			dtask->mgmem = NULL;
 
-			slot = &failed_dma_task_slots[hindex];
-			list_add_tail_rcu(&dtask->chain, slot);
+			list_add_tail_rcu(&dtask->chain, &failed_dma_task_slots[hindex]);
 		}
-		spin_unlock_irqrestore(lock, flags);
+		spin_unlock_irqrestore(&strom_dma_task_locks[hindex], flags);
 		/* wake up all the waiting tasks, if any */
 		wake_up_all(&strom_dma_task_waitq[hindex]);
 
-		/* release the */
+		/* release the dtask object, if no error */
 		if (likely(!dma_status))
 			kfree(dtask);
 		strom_put_mapped_gpu_memory(mgmem);
@@ -846,10 +847,9 @@ strom_put_dma_task(strom_dma_task *dtask, long dma_status)
 		fput(ioctl_filp);
 
 		prDebug("DMA task (id=%p) was completed", dtask);
-
-		return;
 	}
-	spin_unlock_irqrestore(lock, flags);
+	else if (has_spinlock)
+		spin_unlock_irqrestore(&strom_dma_task_locks[hindex], flags);
 }
 
 /*
@@ -1417,7 +1417,9 @@ ioctl_memcpy_ssd2gpu_async(StromCmd__MemCpySsdToGpu __user *uarg,
 
 	/* then, submit asynchronous DMA requests */
 	retval = do_ssd2gpu_async_memcpy(dtask, karg.nchunks, dchunks);
-
+	/* no async jobs will acquire the dtask any more */
+	dtask->frozen = true;
+	barrier();
 	/* release resources no longer referenced */
 	strom_put_dma_task(dtask, retval);
 
@@ -1846,6 +1848,10 @@ ioctl_memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack __user *uarg,
 									  &karg.nr_ssd2gpu,
 									  &karg.nr_dma_submit,
 									  &karg.nr_dma_blocks);
+	/* no more async jobs shall not acquire the @dtask any more */
+	dtask->frozen = true;
+	barrier();
+
 	strom_put_dma_task(dtask, 0);
 
 	/* write back the results */
