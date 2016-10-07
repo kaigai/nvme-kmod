@@ -367,7 +367,7 @@ exec_test_by_strom(CUdeviceptr cuda_devptr, unsigned long handle,
 		for (i=0; i < nchunks; i++)
 		{
 			atask->block_nums[i] = i;
-			uarg->file_pos[i] = i * BLCKSZ;
+			uarg->file_pos[i] = offset + i * BLCKSZ;
 		}
 
 		rv = nvme_strom_ioctl(STROM_IOCTL__MEMCPY_SSD2GPU_WRITEBACK, uarg);
@@ -383,7 +383,8 @@ exec_test_by_strom(CUdeviceptr cuda_devptr, unsigned long handle,
 		if (uarg->nr_ram2gpu > 0)
 		{
 			rc = cuMemcpyHtoDAsync(cuda_devptr + atask->index * chunk_size,
-								   atask->src_buffer,
+								   (char *)atask->src_buffer +
+								   BLCKSZ * (nchunks - uarg->nr_ram2gpu),
 								   BLCKSZ * uarg->nr_ram2gpu,
 								   atask->cuda_stream);
 			cuda_exit_on_error(rc, "cuMemcpyHtoDAsync");

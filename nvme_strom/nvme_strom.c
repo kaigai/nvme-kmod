@@ -1461,7 +1461,7 @@ ioctl_memcpy_ssd2gpu_wait(StromCmd__MemCpySsdToGpuWait __user *uarg,
 /*
  * write back a chunk to user buffer
  */
-static int
+static inline int
 __memcpy_ssd2gpu_writeback(strom_dma_task *dtask,
 						   int nr_pages,
 						   loff_t fpos,
@@ -1538,7 +1538,7 @@ __memcpy_ssd2gpu_writeback(strom_dma_task *dtask,
 /*
  * Submit a P2P DMA request
  */
-static int
+static inline int
 __memcpy_ssd2gpu_submit_dma(strom_dma_task *dtask,
 							int nr_pages,
 							loff_t fpos,
@@ -1702,12 +1702,7 @@ memcpy_ssd2gpu_writeback(strom_dma_task *dtask,
 
 	dest_offset = mgmem->map_offset + buffer_offset;
 	if (dest_offset + nchunks * chunk_size > mgmem->map_length)
-	{
-		prError("map_offset=%zu + buffer_offset=%zu + nchunks=%u * chunk_size=%zu > map_length=%zu",
-				(size_t)mgmem->map_offset, (size_t)buffer_offset,
-				nchunks, (size_t)chunk_size, (size_t)mgmem->map_length);
 		return -ERANGE;
-	}
 
 	i_size = i_size_read(filp->f_inode);
 	for (i=0; i < nchunks; i++)
@@ -1721,11 +1716,7 @@ memcpy_ssd2gpu_writeback(strom_dma_task *dtask,
 		if ((fpos & (PAGE_CACHE_SIZE - 1)) != 0)
 			return -EINVAL;
 		if ((fpos + chunk_size) > i_size)
-		{
-			prError("fpos=%zu + chunk_size=%zu > i_size=%zu",
-					(size_t)fpos, (size_t)chunk_size, (size_t)i_size);
 			return -ERANGE;
-		}
 
 		for (j=0; j < n_pages; j++, fpos += PAGE_CACHE_SIZE)
 		{
