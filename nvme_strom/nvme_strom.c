@@ -1649,6 +1649,12 @@ __memcpy_ssd2gpu_submit_dma(strom_dma_task *dtask,
 			}
 			curr_offset += PAGE_CACHE_SIZE;
 		}
+		/* release page cache, if cached */
+		if (fpage)
+		{
+			unlock_page(fpage);
+			page_cache_release(fpage);
+		}
 	}
 out:
 	/* Error? */
@@ -1705,7 +1711,7 @@ memcpy_ssd2gpu_writeback(strom_dma_task *dtask,
 		return -ERANGE;
 
 	i_size = i_size_read(filp->f_inode);
-	for (i=0; i < nchunks; i++)
+	for (i=nchunks-1; i >= 0; i--)
 	{
 		uint32_t		curr_block_id = (block_nums ? block_nums[i] : ~0);
 		loff_t			fpos = file_pos[i];
